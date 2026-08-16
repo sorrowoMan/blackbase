@@ -22,7 +22,29 @@ import hmac
 
 import numpy as np
 
+from ..types import UnknownState
+
 logger = logging.getLogger(__name__)
+
+GENERIC_SNAPSHOT_SCHEMA = "generic_payload_v1"
+GENERIC_SNAPSHOT_MARKER = "__blackbase_generic_payload__"
+GENERIC_SNAPSHOT_VALUE = "value"
+
+
+def wrap_snapshot_payload(payload: Any) -> Dict[str, Any]:
+    """Wrap an arbitrary payload for stores whose write contract is mapping-only."""
+    return {
+        GENERIC_SNAPSHOT_MARKER: 1,
+        GENERIC_SNAPSHOT_VALUE: payload,
+    }
+
+
+def unwrap_snapshot_payload(value: Any) -> Any:
+    """Return a generic payload from a record, while preserving normal snapshots."""
+    data = value.data if hasattr(value, "data") else value
+    if isinstance(data, Mapping) and data.get(GENERIC_SNAPSHOT_MARKER) == 1:
+        return data.get(GENERIC_SNAPSHOT_VALUE)
+    return data
 
 
 def _report_soft_error(**kwargs: Any) -> None:
@@ -256,6 +278,11 @@ class RedisSnapshotStore(SnapshotStore):
     
     def _to_safe_obj(self, value: Any) -> Any:
         """Convert value to JSON-safe representation."""
+        if isinstance(value, UnknownState):
+            return {
+                "__blackbase_protocol__": "UnknownState",
+                "payload": self._to_safe_obj(value.to_protocol_payload()),
+            }
         if isinstance(value, np.ndarray):
             return {
                 "__ndarray__": value.tolist(),
@@ -275,6 +302,11 @@ class RedisSnapshotStore(SnapshotStore):
     def _from_safe_obj(self, value: Any) -> Any:
         """Restore value from JSON-safe representation."""
         if isinstance(value, dict):
+            if value.get("__blackbase_protocol__") == "UnknownState":
+                payload = self._from_safe_obj(value.get("payload", {}))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("UnknownState protocol payload must be a mapping")
+                return UnknownState.from_protocol_payload(payload)
             if "__ndarray__" in value:
                 arr = np.asarray(value.get("__ndarray__"))
                 dtype = value.get("__dtype__")

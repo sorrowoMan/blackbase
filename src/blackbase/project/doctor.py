@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+from .runtime import path_declares_check_argument
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ def _check_project_root(project_root: Path, diags: list[DoctorDiagnostic], *, st
     cases_dir = project_root / "cases"
     _require_dir(cases_dir, diags)
     _require_file(cases_dir / "__init__.py", diags)
+    _check_project_config(project_root / "project_config.py", diags)
 
     case_count = 0
     if cases_dir.is_dir():
@@ -138,6 +141,474 @@ def _check_project_root(project_root: Path, diags: list[DoctorDiagnostic], *, st
             str(project_root),
         )
     )
+
+
+def _check_project_config(path: Path, diags: list[DoctorDiagnostic]) -> None:
+    if not path.is_file():
+        return
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+    except SyntaxError as exc:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-config-syntax",
+                f"project_config.py has syntax error: {exc}",
+                str(path),
+            )
+        )
+        return
+    stages_value: Any = None
+    l0_value: Any = None
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        if any(isinstance(target, ast.Name) and target.id == "L0" for target in targets):
+            try:
+                l0_value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                l0_value = None
+        if any(isinstance(target, ast.Name) and target.id == "STAGES" for target in targets):
+            try:
+                stages_value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                return
+    if isinstance(l0_value, Mapping):
+        _check_l0_config(dict(l0_value), path=path, diags=diags)
+    if stages_value is None:
+        return
+    if not isinstance(stages_value, (list, tuple)):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-stages-invalid",
+                "STAGES must be a list or tuple of mappings.",
+                str(path),
+            )
+        )
+        return
+    stage_names: list[str] = []
+    for index, raw_stage in enumerate(stages_value):
+        if not isinstance(raw_stage, Mapping):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-stage-invalid",
+                    f"STAGES[{index}] must be a mapping.",
+                    str(path),
+                )
+            )
+            continue
+        stage = dict(raw_stage)
+        stage_name = str(stage.get("name", f"stage_{index}"))
+        stage_names.append(stage_name)
+        cases = stage.get("cases", ()) or ()
+        if isinstance(cases, str) or not isinstance(cases, (list, tuple)):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-stage-cases-invalid",
+                    f"Stage '{stage_name}' cases must be a list or tuple.",
+                    str(path),
+                )
+            )
+            continue
+        case_names = tuple(str(item) for item in cases)
+        if len(case_names) != len(set(case_names)):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-stage-duplicate-case",
+                    f"Stage '{stage_name}' contains duplicate Case names.",
+                    str(path),
+                )
+            )
+        policy = str(stage.get("policy", "serial") or "serial").lower()
+        if policy not in {
+            "serial",
+            "sequential",
+            "run_all_serial",
+            "parallel",
+            "run_all_in_parallel",
+            "external",
+            "external_workers",
+        }:
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-stage-policy-invalid",
+                    f"Stage '{stage_name}' has unsupported policy '{policy}'.",
+                    str(path),
+                )
+            )
+        if policy in {"external", "external_workers"}:
+            _check_external_stage(stage, stage_name=stage_name, path=path, diags=diags)
+        _check_stage_timeouts(stage, stage_name=stage_name, path=path, diags=diags)
+        _check_termination_config(
+            stage.get("termination", {}),
+            label=f"Stage '{stage_name}' termination",
+            path=path,
+            diags=diags,
+        )
+        case_terminations = stage.get("case_termination", {}) or {}
+        if not isinstance(case_terminations, Mapping):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-stage-case-termination-invalid",
+                    f"Stage '{stage_name}' case_termination must be a mapping.",
+                    str(path),
+                )
+            )
+        else:
+            for case_name, raw_policy in case_terminations.items():
+                _check_termination_config(
+                    raw_policy,
+                    label=f"Case '{case_name}' termination",
+                    path=path,
+                    diags=diags,
+                )
+    if len(stage_names) != len(set(stage_names)):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-stage-name-duplicate",
+                "Project Stage names must be unique for manifest recovery.",
+                str(path),
+            )
+        )
+
+
+def _check_stage_timeouts(
+    stage: Mapping[str, Any],
+    *,
+    stage_name: str,
+    path: Path,
+    diags: list[DoctorDiagnostic],
+) -> None:
+    try:
+        timeout = float(stage.get("timeout_seconds", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        timeout = -1.0
+    if timeout < 0:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-stage-timeout-invalid",
+                f"Stage '{stage_name}' timeout_seconds must be non-negative.",
+                str(path),
+            )
+        )
+    case_timeouts = stage.get("case_timeout_seconds", {}) or {}
+    if not isinstance(case_timeouts, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-stage-case-timeouts-invalid",
+                f"Stage '{stage_name}' case_timeout_seconds must be a mapping.",
+                str(path),
+            )
+        )
+        return
+    for case_name, raw_timeout in case_timeouts.items():
+        try:
+            value = float(raw_timeout)
+        except (TypeError, ValueError):
+            value = -1.0
+        if value < 0:
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-case-timeout-invalid",
+                    f"Case '{case_name}' in Stage '{stage_name}' requires a "
+                    "non-negative timeout.",
+                    str(path),
+                )
+            )
+
+
+def _check_l0_config(
+    config: Mapping[str, Any],
+    *,
+    path: Path,
+    diags: list[DoctorDiagnostic],
+) -> None:
+    _check_termination_config(
+        config.get("termination", {}),
+        label="L0.termination",
+        path=path,
+        diags=diags,
+    )
+    artifacts = config.get("artifacts", config.get("artifact_store", {})) or {}
+    if not isinstance(artifacts, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-artifacts-invalid",
+                "L0.artifacts must be a mapping.",
+                str(path),
+            )
+        )
+    else:
+        artifact_path = str(artifacts.get("path", ".blackbase/artifacts") or "").strip()
+        if not artifact_path:
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-l0-artifact-path-missing",
+                    "L0.artifacts.path must be non-empty.",
+                    str(path),
+                )
+            )
+        else:
+            root = path.parent.resolve()
+            candidate = Path(artifact_path)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                candidate.resolve().relative_to(root)
+            except ValueError:
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-l0-artifact-path-outside-root",
+                        "L0.artifacts.path must stay within the Project root.",
+                        str(path),
+                    )
+                )
+    backend = str(config.get("lease_backend", "memory") or "memory").lower()
+    if backend not in {"memory", "sqlite", "redis"}:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-lease-backend-invalid",
+                "L0.lease_backend must be 'memory', 'sqlite', or 'redis'.",
+                str(path),
+            )
+        )
+    if backend == "sqlite" and not str(config.get("lease_path", "")).strip():
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-lease-path-missing",
+                "SQLite L0 lease authority requires L0.lease_path.",
+                str(path),
+            )
+        )
+    if backend == "redis":
+        redis_url = str(config.get("lease_redis_url", "") or "").strip()
+        redis_url_env = str(
+            config.get("lease_redis_url_env", "BLACKBASE_REDIS_URL") or ""
+        ).strip()
+        if not redis_url and not redis_url_env:
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-l0-lease-redis-connection-missing",
+                    "Redis L0 lease authority requires L0.lease_redis_url or "
+                    "L0.lease_redis_url_env.",
+                    str(path),
+                )
+            )
+    try:
+        ttl = float(config.get("lease_ttl_seconds", 30.0))
+        heartbeat = float(config.get("lease_heartbeat_seconds", 10.0))
+    except (TypeError, ValueError):
+        ttl = heartbeat = -1.0
+    if ttl <= 0:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-lease-ttl-invalid",
+                "L0.lease_ttl_seconds must be positive.",
+                str(path),
+            )
+        )
+    if heartbeat <= 0 or heartbeat >= ttl:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-lease-heartbeat-invalid",
+                "L0.lease_heartbeat_seconds must be positive and smaller than lease_ttl_seconds.",
+                str(path),
+            )
+        )
+    raw_budgets = config.get("budgets", {}) or {}
+    if not isinstance(raw_budgets, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-budgets-invalid",
+                "L0.budgets must be a mapping of budget name to non-negative integer limit.",
+                str(path),
+            )
+        )
+    else:
+        valid_budgets = {}
+        for name, raw_limit in raw_budgets.items():
+            budget_name = str(name).strip()
+            try:
+                budget_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                budget_limit = -1
+            if not budget_name or budget_limit < 0:
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-l0-budget-limit-invalid",
+                        "Every L0.budgets entry requires a non-empty name and "
+                        "a non-negative integer limit.",
+                        str(path),
+                    )
+                )
+                continue
+            valid_budgets[budget_name] = budget_limit
+        if valid_budgets and backend == "memory":
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-l0-budget-authority-not-durable",
+                    "L0.budgets requires lease_backend='sqlite' or 'redis' so "
+                    "all Cases share one fenced authority.",
+                    str(path),
+                )
+            )
+
+
+def _check_termination_config(
+    raw: Any,
+    *,
+    label: str,
+    path: Path,
+    diags: list[DoctorDiagnostic],
+) -> None:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-termination-config-invalid",
+                f"{label} must be a mapping.",
+                str(path),
+            )
+        )
+        return
+    config = dict(raw)
+    mode = str(config.get("mode", "cooperative") or "cooperative").strip().lower()
+    if mode not in {"cooperative", "cooperative_then_terminate"}:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-termination-mode-invalid",
+                f"{label}.mode must be cooperative or cooperative_then_terminate.",
+                str(path),
+            )
+        )
+    for key, default, positive in (
+        ("grace_seconds", 5.0, False),
+        ("kill_grace_seconds", 1.0, False),
+        ("poll_interval_seconds", 0.05, True),
+    ):
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            value = -1.0
+        invalid = value <= 0 if positive else value < 0
+        if invalid:
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "project-termination-timing-invalid",
+                    f"{label}.{key} has an invalid value.",
+                    str(path),
+                )
+            )
+
+
+def _check_external_stage(
+    stage: Mapping[str, Any],
+    *,
+    stage_name: str,
+    path: Path,
+    diags: list[DoctorDiagnostic],
+) -> None:
+    external = stage.get("external")
+    if not isinstance(external, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-config-missing",
+                f"External Stage '{stage_name}' must declare an external mapping.",
+                str(path),
+            )
+        )
+        return
+    config = dict(external)
+    backend = str(config.get("backend", "sqlite") or "sqlite").lower()
+    if backend not in {"sqlite", "redis"}:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-backend-unsupported",
+                f"External Stage '{stage_name}' supports backend='sqlite' or 'redis'.",
+                str(path),
+            )
+        )
+    if backend != "redis" and not str(config.get("transport_path", "")).strip():
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-transport-path-missing",
+                f"External Stage '{stage_name}' must declare external.transport_path.",
+                str(path),
+            )
+        )
+    if backend == "redis" and not str(config.get("redis_url", "")).strip():
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-redis-url-missing",
+                f"External Stage '{stage_name}' must declare external.redis_url.",
+                str(path),
+            )
+        )
+    if backend == "redis" and not str(config.get("namespace", "")).strip():
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-redis-namespace-missing",
+                f"External Stage '{stage_name}' must declare external.namespace.",
+                str(path),
+            )
+        )
+    stage_mode = str(stage.get("mode", "build") or "build")
+    case_modes = stage.get("case_modes", {}) or {}
+    if not isinstance(case_modes, Mapping):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-case-modes-invalid",
+                f"External Stage '{stage_name}' case_modes must be a mapping.",
+                str(path),
+            )
+        )
+        return
+    invalid = {
+        str(case_name): str(case_modes.get(case_name, stage_mode) or "build")
+        for case_name in tuple(stage.get("cases", ()) or ())
+        if str(case_modes.get(case_name, stage_mode) or "build") != "build"
+    }
+    if invalid:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-external-cli-mode",
+                f"External Stage '{stage_name}' requires mode='build': {invalid}.",
+                str(path),
+            )
+        )
 
 
 def _check_case_root(case_root: Path, diags: list[DoctorDiagnostic], *, strict: bool) -> None:
@@ -156,30 +627,12 @@ def _check_case_root(case_root: Path, diags: list[DoctorDiagnostic], *, strict: 
         )
         kind = "solver"
 
-    primary_build = "build_trainer.py" if kind == "trainer" else "build_solver.py"
-    primary_run = "run_trainer.py" if kind == "trainer" else "run_solver.py"
-    other_build = "build_solver.py" if kind == "trainer" else "build_trainer.py"
-    other_run = "run_solver.py" if kind == "trainer" else "run_trainer.py"
-    _require_file(case_root / primary_build, diags)
-    _require_file(case_root / primary_run, diags)
-    if (case_root / other_build).exists():
-        diags.append(
-            DoctorDiagnostic(
-                "error",
-                "case-dual-build-entry",
-                f"Case kind={kind} must not also define {other_build}.",
-                str(case_root / other_build),
-            )
-        )
-    if (case_root / other_run).exists():
-        diags.append(
-            DoctorDiagnostic(
-                "error",
-                "case-dual-run-entry",
-                f"Case kind={kind} must not also define {other_run}.",
-                str(case_root / other_run),
-            )
-        )
+    build_solver = case_root / "build_solver.py"
+    run_solver = case_root / "run_solver.py"
+    build_trainer = case_root / "build_trainer.py"
+    run_trainer = case_root / "run_trainer.py"
+    for entry in (build_solver, run_solver, build_trainer, run_trainer):
+        _require_file(entry, diags)
 
     for dirname in ("problem", "pipeline", "adapter", "bias", "plugins", "evaluation", "runtime"):
         _require_dir(case_root / dirname, diags)
@@ -190,13 +643,31 @@ def _check_case_root(case_root: Path, diags: list[DoctorDiagnostic], *, strict: 
     if (case_root / "assembly" / "scaffold.json").is_file():
         diags.append(DoctorDiagnostic("error", "case-assembly-scaffold-json", "assembly/scaffold.json is not a formal build entry.", str(case_root / "assembly" / "scaffold.json")))
 
-    _check_build_signature(case_root / primary_build, kind=kind, diags=diags, strict=strict)
+    _check_build_signature(build_solver, diags=diags, strict=strict)
+    _check_run_check_contract(run_solver, diags=diags, strict=strict)
+    _check_thin_alias(
+        build_trainer,
+        source_module="build_solver",
+        source_name="build_solver",
+        alias_name="build_trainer",
+        code="case-build-trainer-not-thin-alias",
+        diags=diags,
+    )
+    _check_thin_alias(
+        run_trainer,
+        source_module="run_solver",
+        source_name="main",
+        alias_name="main",
+        code="case-run-trainer-not-thin-alias",
+        allow_main_guard=True,
+        diags=diags,
+    )
 
 
-def _check_build_signature(path: Path, *, kind: str, diags: list[DoctorDiagnostic], strict: bool) -> None:
+def _check_build_signature(path: Path, *, diags: list[DoctorDiagnostic], strict: bool) -> None:
     if not path.is_file():
         return
-    func_name = "build_trainer" if kind == "trainer" else "build_solver"
+    func_name = "build_solver"
     try:
         tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
     except SyntaxError as exc:
@@ -222,6 +693,158 @@ def _check_build_signature(path: Path, *, kind: str, diags: list[DoctorDiagnosti
                     str(path),
                 )
             )
+    for returned in _iter_function_returns(target):
+        value = returned.value
+        if isinstance(value, ast.Lambda) or (
+            isinstance(value, ast.Name)
+            and value.id in {"main", "run", "run_case", "fit"}
+        ):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "case-build-returns-entry-callable",
+                    "build_solver() must return a built Case/Trainer/Solver, not a CLI or runner function.",
+                    str(path),
+                )
+            )
+            break
+        if isinstance(value, (ast.Dict, ast.List, ast.Tuple, ast.Set, ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            diags.append(
+                DoctorDiagnostic(
+                    "error",
+                    "case-build-returns-collection",
+                    "build_solver() must return one built Case/Trainer/Solver; multi-Case orchestration belongs to Project.",
+                    str(path),
+                )
+            )
+            break
+
+
+def _iter_function_returns(function: ast.FunctionDef) -> Iterable[ast.Return]:
+    pending: list[ast.AST] = list(function.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Return):
+            yield node
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+
+
+def _check_run_check_contract(path: Path, *, diags: list[DoctorDiagnostic], strict: bool) -> None:
+    """Require a discoverable, side-effect-bounded assembly-check CLI contract."""
+
+    if not path.is_file():
+        return
+    if path_declares_check_argument(path):
+        return
+    level = "error" if strict else "warn"
+    diags.append(
+        DoctorDiagnostic(
+            level,
+            "case-run-missing-check-contract",
+            "run_solver.py should expose --check so assembly can be audited without running the Case.",
+            str(path),
+        )
+    )
+
+
+def _check_thin_alias(
+    path: Path,
+    *,
+    source_module: str,
+    source_name: str,
+    alias_name: str,
+    code: str,
+    allow_main_guard: bool = False,
+    diags: list[DoctorDiagnostic],
+) -> None:
+    if not path.is_file():
+        return
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+    except SyntaxError as exc:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                code,
+                f"{path.name} must be a thin alias but has syntax error: {exc}",
+                str(path),
+            )
+        )
+        return
+
+    body = list(tree.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    valid_import = False
+    if body and isinstance(body[0], ast.ImportFrom):
+        entry = body[0]
+        valid_import = (
+            entry.level == 1
+            and entry.module == source_module
+            and len(entry.names) == 1
+            and entry.names[0].name == source_name
+            and (entry.names[0].asname or entry.names[0].name) == alias_name
+        )
+    valid = valid_import and (
+        len(body) == 1
+        or (
+            allow_main_guard
+            and len(body) == 2
+            and _is_standard_main_guard(body[1], callable_name=alias_name)
+        )
+    )
+    if not valid:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                code,
+                (
+                    f"{path.name} must only re-export "
+                    f".{source_module}.{source_name} as {alias_name}."
+                ),
+                str(path),
+            )
+        )
+
+
+def _is_standard_main_guard(node: ast.stmt, *, callable_name: str) -> bool:
+    if not isinstance(node, ast.If) or node.orelse or len(node.body) != 1:
+        return False
+    test = node.test
+    if not (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    ):
+        return False
+    statement = node.body[0]
+    if not isinstance(statement, ast.Raise) or not isinstance(statement.exc, ast.Call):
+        return False
+    exit_call = statement.exc
+    if not isinstance(exit_call.func, ast.Name) or exit_call.func.id != "SystemExit":
+        return False
+    if len(exit_call.args) != 1 or not isinstance(exit_call.args[0], ast.Call):
+        return False
+    target_call = exit_call.args[0]
+    return (
+        isinstance(target_call.func, ast.Name)
+        and target_call.func.id == callable_name
+        and not target_call.args
+        and not target_call.keywords
+    )
 
 
 def _require_file(path: Path, diags: list[DoctorDiagnostic]) -> None:

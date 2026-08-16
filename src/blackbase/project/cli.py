@@ -73,6 +73,13 @@ def add_project_subcommands(
     p_run.add_argument("--group", default="default", help="Execution group from project_config.py")
     p_run.add_argument("--check", action="store_true", help="Print assembly/resource audit without running cases")
     p_run.add_argument("--build-check", action="store_true", help="Instantiate builders in check mode")
+    p_run.add_argument("--run-id", default=None, help="Optional durable run manifest identifier")
+    p_run.add_argument(
+        "--resume-from",
+        default=None,
+        help="Prior run id, run directory, or manifest.json to resume from",
+    )
+    p_run.add_argument("--no-record", action="store_true", help="Disable run manifest persistence")
     p_run.add_argument("case_args", nargs=argparse.REMAINDER, help="Arguments forwarded after '--'")
     p_run.set_defaults(project_action="run")
 
@@ -130,6 +137,9 @@ def handle_project_command(
                 check=bool(getattr(args, "check", False)),
                 build_check=bool(getattr(args, "build_check", False)),
                 case_args=case_args,
+                record=not bool(getattr(args, "no_record", False)),
+                run_id=getattr(args, "run_id", None),
+                resume_from=getattr(args, "resume_from", None),
             )
         )
     return 2

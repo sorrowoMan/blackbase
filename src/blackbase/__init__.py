@@ -13,7 +13,13 @@ from . import kernel
 from . import project
 from . import plugin
 from . import contracts
-from .types import Feedback, PopulationSnapshot, TrainerResult, UnknownState
+from .types import (
+    SHARED_TYPE_SCHEMA_VERSION,
+    Feedback,
+    PopulationSnapshot,
+    TrainerResult,
+    UnknownState,
+)
 
 
 __all__ = [
@@ -23,6 +29,7 @@ __all__ = [
     "project",
     "plugin",
     "contracts",
+    "SHARED_TYPE_SCHEMA_VERSION",
     "Feedback",
     "UnknownState",
     "PopulationSnapshot",

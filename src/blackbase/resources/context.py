@@ -1,9 +1,4 @@
-"""
-Resource context and audit for MLBlack integration.
-
-This module provides MLBlack-specific resource context extensions while maintaining
-compatibility with the core L0 resource model.
-"""
+"""Shared passive resource context and audit primitives."""
 
 from __future__ import annotations
 
@@ -101,6 +96,48 @@ class ResourceContext:
             "lease": dict(self.lease),
             "metadata": dict(self.metadata),
         }
+
+    def derive_child(
+        self,
+        *,
+        scope: str,
+        namespace_suffix: str = "",
+        threads: int | None = None,
+        execution_backend: str | None = None,
+        compute_backend: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "ResourceContext":
+        """Derive a nested subgrant without minting a new Project-level lease."""
+
+        child_threads = int(self.threads) if threads is None else max(1, min(int(threads), int(self.threads)))
+        suffix = str(namespace_suffix or "").strip(".")
+        namespace = str(self.namespace or "").strip(".")
+        if suffix:
+            namespace = f"{namespace}.{suffix}" if namespace else suffix
+        grant = dict(self.grant)
+        grant["threads"] = child_threads
+        if "workers" in grant:
+            grant["workers"] = min(max(1, int(grant.get("workers", child_threads) or child_threads)), child_threads)
+        lease = dict(self.lease)
+        lease_id = str(lease.get("lease_id", ""))
+        child_metadata = {
+            **dict(self.metadata),
+            "parent_namespace": str(self.namespace),
+            "parent_lease_id": lease_id,
+            **dict(metadata or {}),
+        }
+        return ResourceContext(
+            scope=str(scope or self.scope),
+            execution_backend=str(execution_backend or self.execution_backend),
+            compute_backend=str(compute_backend or self.compute_backend),
+            device=str(self.device),
+            threads=child_threads,
+            nested=True,
+            namespace=namespace,
+            grant=grant,
+            lease=lease,
+            metadata=child_metadata,
+        )
     
     def context_items(self, *, prefix: str = "resource") -> dict[str, Any]:
         """Get context items with specified prefix."""

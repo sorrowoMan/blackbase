@@ -177,7 +177,13 @@ def _write_default_project(project_path: Path, *, framework: str) -> None:
     (project_path / "cases" / "__init__.py").write_text("", encoding="utf-8")
     (project_path / "README.md").write_text(
         f"# {project_path.name}\n\n"
-        "Standard Project/Case/Scaffold project using the shared blackbase substrate.\n",
+        "这是使用 blackbase 共享 substrate 的标准 Project / Case / Scaffold 项目。\n\n"
+        "- `python run_project.py --check --build-check`：只检查装配与资源授权。\n"
+        "- `python run_project.py`：执行并写入 `.blackbase/runs/<run-id>/manifest.json`。\n"
+        "- `python run_project.py --resume-from <run-id>`：从兼容的运行记录恢复。\n"
+        "- Stage 可声明 `policy=serial|parallel|external`；并行/外部 Case 必须使用 `mode=build`。\n"
+        "- 外部 worker：`python -m blackbase.project.external_worker --project-root . "
+        "--transport .blackbase/external_tasks.sqlite`。\n",
         encoding="utf-8",
     )
     (project_path / "project_config.py").write_text(_default_project_config(project_path.name), encoding="utf-8")
@@ -192,51 +198,61 @@ def _normalize_case_scaffold(case_path: Path, *, case_name: str, case_kind: str,
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "__init__.py").touch()
     _write_case_marker(case_path, case_name=case_name, kind=case_kind, framework=framework)
-    _remove_non_primary_entries(case_path, case_kind=case_kind)
+    _ensure_pipeline_entry(case_path, case_kind=case_kind)
     _ensure_primary_entries(case_path, case_kind=case_kind, framework=framework)
     if not (case_path / "config.py").is_file():
         (case_path / "config.py").write_text(_case_config_template(), encoding="utf-8")
 
 
-def _remove_non_primary_entries(case_path: Path, *, case_kind: str) -> None:
-    # Both solver and trainer entries should exist; no files need removal.
-    # The non-primary entry will be created as a thin alias by _ensure_alias_entries.
-    pass
+def _ensure_pipeline_entry(case_path: Path, *, case_kind: str) -> None:
+    """Ensure every generated Case has one executable pipeline entry."""
+
+    pipeline_dir = case_path / "pipeline"
+    pipeline_module = case_path / "pipeline.py"
+    pipeline_main = pipeline_dir / "main.py"
+    if not pipeline_main.is_file() and not pipeline_module.is_file():
+        pipeline_main.write_text(_pipeline_entry_template(case_kind), encoding="utf-8")
+
+    pipeline_init = pipeline_dir / "__init__.py"
+    if not pipeline_init.read_text(encoding="utf-8-sig", errors="replace").strip():
+        pipeline_init.write_text(
+            '"""Case-level pipeline public surface."""\n\n'
+            "from .main import build_pipeline, run_pipeline_slot\n\n"
+            '__all__ = ["build_pipeline", "run_pipeline_slot"]\n',
+            encoding="utf-8",
+        )
 
 
 def _ensure_primary_entries(case_path: Path, *, case_kind: str, framework: str = "blackbase") -> None:
-    # Canonical entry: kind determines the primary
-    if case_kind == "trainer":
-        if not (case_path / "build_trainer.py").is_file():
-            (case_path / "build_trainer.py").write_text(_build_entry_template("trainer", framework=framework), encoding="utf-8")
-        if not (case_path / "run_trainer.py").is_file():
-            (case_path / "run_trainer.py").write_text(_run_entry_template("trainer"), encoding="utf-8")
-    else:
-        if not (case_path / "build_solver.py").is_file():
-            (case_path / "build_solver.py").write_text(_build_entry_template("solver", framework=framework), encoding="utf-8")
-        if not (case_path / "run_solver.py").is_file():
-            (case_path / "run_solver.py").write_text(_run_entry_template("solver"), encoding="utf-8")
-    # Alias entry: the other kind's files as thin aliases
-    _ensure_alias_entries(case_path, case_kind=case_kind)
+    """Ensure the one shared Case entry shape for every semantic kind."""
+
+    build_solver = case_path / "build_solver.py"
+    if not build_solver.is_file():
+        build_solver.write_text(
+            _build_entry_template(case_kind, framework=framework),
+            encoding="utf-8",
+        )
+    run_solver = case_path / "run_solver.py"
+    if not run_solver.is_file():
+        run_solver.write_text(_run_entry_template(case_kind, framework=framework), encoding="utf-8")
+    _ensure_alias_entries(case_path)
 
 
-def _ensure_alias_entries(case_path: Path, *, case_kind: str) -> None:
-    if case_kind == "trainer":
-        # build_solver.py is the alias
-        alias_build = case_path / "build_solver.py"
-        if not alias_build.is_file():
-            alias_build.write_text("from .build_trainer import build_trainer as build_solver\n", encoding="utf-8")
-        alias_run = case_path / "run_solver.py"
-        if not alias_run.is_file():
-            alias_run.write_text('from .run_trainer import main\n\nif __name__ == "__main__":\n    raise SystemExit(main())\n', encoding="utf-8")
-    else:
-        # build_trainer.py is the alias
-        alias_build = case_path / "build_trainer.py"
-        if not alias_build.is_file():
-            alias_build.write_text("from .build_solver import build_solver as build_trainer\n", encoding="utf-8")
-        alias_run = case_path / "run_trainer.py"
-        if not alias_run.is_file():
-            alias_run.write_text('from .run_solver import main\n\nif __name__ == "__main__":\n    raise SystemExit(main())\n', encoding="utf-8")
+def _ensure_alias_entries(case_path: Path) -> None:
+    """Create trainer-named compatibility aliases without a second entry implementation."""
+
+    alias_build = case_path / "build_trainer.py"
+    if not alias_build.is_file():
+        alias_build.write_text(
+            "from .build_solver import build_solver as build_trainer\n",
+            encoding="utf-8",
+        )
+    alias_run = case_path / "run_trainer.py"
+    if not alias_run.is_file():
+        alias_run.write_text(
+            'from .run_solver import main\n\nif __name__ == "__main__":\n    raise SystemExit(main())\n',
+            encoding="utf-8",
+        )
 
 
 def _rename_template_files(root: Path) -> None:
@@ -456,7 +472,7 @@ def _nsgablack_bias_template(class_name: str, component_name: str, kind: str) ->
 def _nsgablack_plugin_template(class_name: str, component_name: str, kind: str) -> str:
     return (
         f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from nsgablack.plugins.base import Plugin\n\n\n"
+        f"from blackbase.plugin import Plugin\n\n\n"
         f"class {class_name}(Plugin):\n"
         f'    """TODO: implement plugin lifecycle hooks."""\n\n'
         f"    pass\n"
@@ -570,6 +586,53 @@ def _pipeline_component_template(component_name: str, *, slot: str | None) -> st
     )
 
 
+def _pipeline_entry_template(case_kind: str) -> str:
+    pipeline_key = "trainer_default" if str(case_kind) == "trainer" else "solver_default"
+    return f'''"""Canonical Case-level pipeline entry.
+
+Compose fine-grained operators here and keep ``build_solver.py`` focused on
+assembling the Case lifecycle.
+"""
+
+from typing import Any, Mapping
+
+from blackbase.kernel import PipelineSpec, build_pipeline_kernel
+
+
+def _build_kernel(*, component_overrides: Mapping[str, Any] | None = None):
+    overrides = dict(component_overrides or {{}})
+    registry = dict(overrides.get("pipeline_operators", {{}}) or {{}})
+    spec = PipelineSpec.from_value(
+        overrides.get("pipeline_spec", {{"key": "{pipeline_key}", "slots": ()}})
+    )
+    return build_pipeline_kernel(spec, operator_registry=registry)
+
+
+def build_pipeline(
+    *,
+    resource_context: Mapping[str, Any] | None = None,
+    component_overrides: Mapping[str, Any] | None = None,
+):
+    """Build the Case representation pipeline from its declared slots."""
+
+    del resource_context
+    return _build_kernel(component_overrides=component_overrides).representation_pipeline
+
+
+def run_pipeline_slot(
+    slot: str,
+    value,
+    *,
+    component_overrides: Mapping[str, Any] | None = None,
+    context: Mapping[str, Any] | None = None,
+):
+    """Run one declared slot through the same canonical kernel."""
+
+    kernel = _build_kernel(component_overrides=component_overrides)
+    return kernel.run_slot(slot, value, dict(context or {{}}))
+'''
+
+
 def _default_project_config(project_name: str) -> str:
     return f'''"""Project-level orchestration configuration."""
 
@@ -582,11 +645,31 @@ L0 = {{
     "default_request": {{"threads": 1, "gpus": 0, "backend": "local", "device": "cpu"}},
     "compute_backend": "auto",
     "execution_backend": "local",
+    "lease_backend": "sqlite",
+    "lease_path": ".blackbase/l0_leases.sqlite",
+    # Multi-host: use lease_backend="redis" and set lease_redis_url_env.
+    # Redis credentials are resolved from the worker environment, not ResourceContext.
+    "lease_ttl_seconds": 30,
+    "lease_heartbeat_seconds": 10,
+    # Optional run-scoped hard limits shared by every Case/process.
+    # Example: "budgets": {{"evaluations": 10000}},
+    "budgets": {{}},
+    # Artifact refs are minted only after an atomic write under this Project root.
+    "artifacts": {{"path": ".blackbase/artifacts", "allow_unsafe_serializers": False}},
+    # Change mode to cooperative_then_terminate for isolated hard-SLA Cases.
+    "termination": {{
+        "mode": "cooperative",
+        "grace_seconds": 5.0,
+        "kill_grace_seconds": 1.0,
+        "poll_interval_seconds": 0.05,
+    }},
 }}
 
 STAGES = [
     {{
         "name": "stage_1",
+        "policy": "serial",
+        "failure_policy": "fail_fast",
         "cases": [],
         "resource_requests": {{}},
     }},
@@ -637,7 +720,7 @@ if __name__ == "__main__":
 
 
 def _build_entry_template(kind: str, framework: str = "blackbase") -> str:
-    func = "build_trainer" if kind == "trainer" else "build_solver"
+    func = "build_solver"
     # Framework-specific import hints
     if framework == "nsgablack":
         imports = (
@@ -645,7 +728,7 @@ def _build_entry_template(kind: str, framework: str = "blackbase") -> str:
             "from nsgablack.adapters.algorithm_adapter import AlgorithmAdapter\n"
             "from nsgablack.representation.base import RepresentationPipeline\n"
             "from nsgablack.bias.core.base import BiasBase\n"
-            "from nsgablack.plugins.base import Plugin\n"
+            "from blackbase.plugin import Plugin\n"
         )
     elif framework == "mlblack":
         imports = (
@@ -678,14 +761,16 @@ def {func}(*, resource_context=None, component_overrides=None):
 '''
 
 
-def _run_entry_template(kind: str) -> str:
-    func = "build_trainer" if kind == "trainer" else "build_solver"
-    module = "build_trainer" if kind == "trainer" else "build_solver"
+def _run_entry_template(kind: str, *, framework: str = "blackbase") -> str:
+    func = "build_solver"
+    module = "build_solver"
     verb = "fit" if kind == "trainer" else "run"
     return f'''"""CLI entry point for this {kind} case."""
 
 import argparse
 
+from blackbase.project import load_resource_context_from_env, print_resource_context_summary
+from blackbase.project.check_output import print_case_check
 from .{module} import {func}
 
 
@@ -693,10 +778,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run this {kind} case.")
     parser.add_argument("--check", action="store_true", help="Build only; do not run.")
     args = parser.parse_args(argv)
-    case = {func}()
+    resource_context = load_resource_context_from_env("{framework}")
+    case = {func}(resource_context=resource_context)
     if args.check:
-        print("[check] assembly ok | case=" + type(case).__name__)
+        print_case_check(case)
         return 0
+    print_resource_context_summary(resource_context)
     action = getattr(case, "{verb}", None) or getattr(case, "run", None) or getattr(case, "step", None)
     result = action() if callable(action) else case
     print(result)

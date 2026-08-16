@@ -64,6 +64,9 @@ from .context_events import (
     replay_context,
 )
 from .snapshot_store import (
+    GENERIC_SNAPSHOT_MARKER,
+    GENERIC_SNAPSHOT_SCHEMA,
+    GENERIC_SNAPSHOT_VALUE,
     SnapshotHandle,
     SnapshotRecord,
     SnapshotStore,
@@ -72,6 +75,8 @@ from .snapshot_store import (
     RedisSnapshotStore,
     create_snapshot_store,
     make_snapshot_key,
+    unwrap_snapshot_payload,
+    wrap_snapshot_payload,
 )
 
 
@@ -133,6 +138,9 @@ __all__ = [
     "replay_context",
     
     # snapshot_store
+    "GENERIC_SNAPSHOT_MARKER",
+    "GENERIC_SNAPSHOT_SCHEMA",
+    "GENERIC_SNAPSHOT_VALUE",
     "SnapshotHandle",
     "SnapshotRecord",
     "SnapshotStore",
@@ -141,4 +149,6 @@ __all__ = [
     "RedisSnapshotStore",
     "create_snapshot_store",
     "make_snapshot_key",
+    "unwrap_snapshot_payload",
+    "wrap_snapshot_payload",
 ]
