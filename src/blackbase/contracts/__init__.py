@@ -16,10 +16,12 @@ from .component_contract import (
     ContractMixin,
     combine_contracts,
 )
+from .batch import BatchDisposition
 
 
 __all__ = [
     "ComponentContract",
     "ContractMixin",
     "combine_contracts",
+    "BatchDisposition",
 ]

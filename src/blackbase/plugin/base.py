@@ -362,15 +362,18 @@ class PluginManager:
             and len(args) >= 1
             and isinstance(args[0], dict)
         )
+        current_context = args[0] if is_context_build else None
         for plugin in self.plugins:
             if not plugin.enabled:
+                continue
+            if bool(getattr(plugin, "_attach_failed", False)):
                 continue
             handler = getattr(plugin, event_name, None)
             if handler and callable(handler):
                 before_ctx = None
                 if is_context_build:
                     try:
-                        before_ctx = copy.deepcopy(args[0])
+                        before_ctx = copy.deepcopy(current_context)
                     except Exception as exc:
                         report_soft_error(
                             component="PluginManager",
@@ -380,9 +383,14 @@ class PluginManager:
                             strict=False,
                             level="debug",
                         )
-                        before_ctx = dict(args[0])
+                        before_ctx = dict(current_context or {})
                 try:
-                    result = handler(*args, **kwargs)
+                    call_args = (
+                        (current_context, *args[1:])
+                        if is_context_build
+                        else args
+                    )
+                    result = handler(*call_args, **kwargs)
                 except Exception as exc:
                     self._emit_event_hook(
                         {
@@ -421,12 +429,13 @@ class PluginManager:
                 )
 
                 if is_context_build and before_ctx is not None:
-                    after_ctx = result if isinstance(result, dict) else args[0]
+                    after_ctx = result if isinstance(result, dict) else current_context
                     if isinstance(after_ctx, dict):
                         changed = self._collect_changed_keys(before_ctx, after_ctx)
                         source = f"plugin.{plugin.name}"
                         for key in changed:
                             context_writers[str(key)] = source
+                        current_context = after_ctx
 
                 if result is not None:
                     out = result
@@ -445,6 +454,8 @@ class PluginManager:
                         strict=False,
                         level="debug",
                     )
+        if is_context_build:
+            return current_context
         return out
 
     def on_solver_init(self, solver):
@@ -466,8 +477,44 @@ class PluginManager:
             if plugin.enabled:
                 if bool(getattr(plugin, "_attach_failed", False)):
                     continue
-                plugin.attach(solver)
-                plugin.on_solver_init(solver)
+                try:
+                    if getattr(plugin, "solver", None) is not solver:
+                        plugin.attach(solver)
+                except Exception as exc:
+                    plugin._attach_failed = True
+                    plugin._attach_error = str(exc)
+                    if bool(getattr(solver, "plugin_strict", False)):
+                        raise
+                    report_soft_error(
+                        component="PluginManager",
+                        event="on_solver_init.attach",
+                        exc=exc,
+                        logger=logger,
+                        strict=False,
+                        level="warning",
+                    )
+                    continue
+                try:
+                    plugin.on_solver_init(solver)
+                except Exception as exc:
+                    strict_init = bool(getattr(plugin, "raise_on_init_error", False)) or bool(
+                        getattr(plugin, "strict_init", False)
+                    )
+                    if strict_init:
+                        raise
+                    warnings.warn(
+                        f"Plugin '{plugin.name}' init failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    report_soft_error(
+                        component="PluginManager",
+                        event="on_solver_init.hook",
+                        exc=exc,
+                        logger=logger,
+                        strict=False,
+                        level="warning",
+                    )
 
     def on_population_init(self, population, objectives, violations):
         self.trigger("on_population_init", population, objectives, violations)

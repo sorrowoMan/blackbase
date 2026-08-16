@@ -13,6 +13,10 @@ from .spec import (
 )
 from .orchestrator import (
     OrchestrationPolicy,
+    ParallelBranchFailure,
+    PipelineCancellationError,
+    PipelineLateWriteRejected,
+    PipelineParallelError,
     PipelineOrchestrator,
     PipelineKernelBuild,
     build_pipeline_kernel,
@@ -113,6 +117,10 @@ __all__ = [
     
     # orchestrator
     "OrchestrationPolicy",
+    "ParallelBranchFailure",
+    "PipelineCancellationError",
+    "PipelineLateWriteRejected",
+    "PipelineParallelError",
     "PipelineOrchestrator",
     "PipelineKernelBuild",
     "build_pipeline_kernel",

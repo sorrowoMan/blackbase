@@ -48,11 +48,14 @@ class PipelineSlotSpec:
     mode: str = "serial"               # Execution mode: serial/parallel/router
     method: Optional[str] = None       # Override method name
     routes: Mapping[str, str] = field(default_factory=dict)  # Route mapping for router mode
+    stages: Sequence[tuple[int, str]] = ()  # Generation threshold -> operator name
     selector_key: str = "strategy_id"  # Context key for route selection
     index_key: str = "vns_k"           # Context key for index-based selection
     default_operator: Optional[str] = None
     strict: Optional[bool] = None       # Strict mode for operator resolution
     merge: Optional[str] = None        # Merge strategy for parallel results
+    timeout_seconds: Optional[float] = None  # Whole-slot wall-clock deadline
+    cancel_on_error: bool = True       # Stop pending branches after strict failure
     
     @classmethod
     def from_value(cls, value: Mapping[str, Any] | "PipelineSlotSpec") -> "PipelineSlotSpec":
@@ -60,12 +63,15 @@ class PipelineSlotSpec:
         if isinstance(value, PipelineSlotSpec):
             return value
         payload = dict(value or {})
+        raw_stages = payload.get("stages", ()) or ()
+        stage_items = raw_stages.items() if isinstance(raw_stages, Mapping) else raw_stages
         return cls(
             slot=str(payload.get("slot", payload.get("name", ""))),
             operators=tuple(str(name) for name in payload.get("operators", ()) if str(name).strip()),
             mode=str(payload.get("mode", "serial") or "serial"),
             method=str(payload.get("method")) if payload.get("method") not in (None, "") else None,
             routes={str(k): str(v) for k, v in dict(payload.get("routes", {}) or {}).items()},
+            stages=tuple((int(start), str(name)) for start, name in stage_items),
             selector_key=str(payload.get("selector_key", "strategy_id") or "strategy_id"),
             index_key=str(payload.get("index_key", "vns_k") or "vns_k"),
             default_operator=(
@@ -75,6 +81,12 @@ class PipelineSlotSpec:
             ),
             strict=payload.get("strict"),
             merge=str(payload.get("merge")) if payload.get("merge") not in (None, "") else None,
+            timeout_seconds=(
+                float(payload.get("timeout_seconds"))
+                if payload.get("timeout_seconds") not in (None, "")
+                else None
+            ),
+            cancel_on_error=bool(payload.get("cancel_on_error", True)),
         )
     
     def as_dict(self) -> dict[str, Any]:
@@ -85,11 +97,14 @@ class PipelineSlotSpec:
             "mode": str(self.mode),
             "method": self.method,
             "routes": dict(self.routes),
+            "stages": [[int(start), str(name)] for start, name in self.stages],
             "selector_key": str(self.selector_key),
             "index_key": str(self.index_key),
             "default_operator": self.default_operator,
             "strict": self.strict,
             "merge": self.merge,
+            "timeout_seconds": self.timeout_seconds,
+            "cancel_on_error": bool(self.cancel_on_error),
         }
 
 

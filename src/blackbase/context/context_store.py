@@ -47,6 +47,40 @@ class _ContextStoreABC(ABC):
         for key, value in values.items():
             self.set(str(key), value, ttl_seconds=ttl_seconds)
 
+    def __getitem__(self, key: str) -> Any:
+        missing = object()
+        value = self.get(str(key), missing)
+        if value is missing:
+            raise KeyError(str(key))
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.set(str(key), value)
+
+    def __delitem__(self, key: str) -> None:
+        if str(key) not in self:
+            raise KeyError(str(key))
+        self.delete(str(key))
+
+    def __iter__(self):
+        return iter(self.snapshot())
+
+    def __len__(self) -> int:
+        return len(self.snapshot())
+
+    def __contains__(self, key: object) -> bool:
+        missing = object()
+        return self.get(str(key), missing) is not missing
+
+    def items(self):
+        return self.snapshot().items()
+
+    def keys(self):
+        return self.snapshot().keys()
+
+    def values(self):
+        return self.snapshot().values()
+
 
 class InMemoryContextStore(_ContextStoreABC):
     """Default context store backend - in-memory implementation."""

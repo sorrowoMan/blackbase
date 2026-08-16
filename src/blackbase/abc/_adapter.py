@@ -15,6 +15,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from ..contracts import BatchDisposition
+
 
 class AdapterBase(ABC):
     """Abstract base class for algorithm adapters / optimizer adapters.
@@ -85,6 +87,20 @@ class AdapterBase(ABC):
     def teardown(self, control: Any) -> None:
         """Called once after the run ends."""
         return None
+
+    def on_proposal_disposition(
+        self,
+        control: Any,
+        disposition: BatchDisposition,
+        context: Mapping[str, Any],
+    ) -> None:
+        """Reconcile proposal-owned state after partial batch admission.
+
+        Stateful adapters that retain one pending record per proposed item
+        should project that state through ``disposition.accepted_indices``.
+        Stateless adapters can keep the default no-op implementation.
+        """
+        del control, disposition, context
 
     # --- State persistence ---
 

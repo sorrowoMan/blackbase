@@ -54,29 +54,34 @@ class ComponentContract:
     ) -> "ComponentContract":
         """Create a ComponentContract from a ContextContract."""
         return cls(
-            name="",
+            name=contract.name,
             requires=tuple(contract.requires),
-            optional=tuple(),
+            optional=tuple(contract.optional),
             provides=tuple(contract.provides),
             mutates=tuple(contract.mutates),
             cache=tuple(contract.cache),
             supports_gradient=supports_gradient,
             supports_batch=supports_batch,
             supports_resume=supports_resume,
-            requires_metrics=tuple(),
-            metrics_fallback="strict",
+            requires_metrics=tuple(contract.requires_metrics),
+            metrics_fallback=contract.metrics_fallback,
             context_notes=contract.notes or "",
-            metadata={**dict(metadata or {})},
+            metadata={**dict(contract.metadata), **dict(metadata or {})},
         )
 
     def to_context_contract(self) -> ContextContract:
         """Convert to a ContextContract."""
         return ContextContract(
+            name=self.name,
             requires=self.requires,
+            optional=self.optional,
             provides=self.provides,
             mutates=self.mutates,
             cache=self.cache,
             notes=self.context_notes or None,
+            requires_metrics=self.requires_metrics,
+            metrics_fallback=self.metrics_fallback,
+            metadata=self.metadata,
         )
 
     def with_name(self, name: str) -> "ComponentContract":
