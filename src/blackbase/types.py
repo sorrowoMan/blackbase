@@ -20,6 +20,20 @@ SHARED_TYPE_SCHEMA_VERSION = 1
 _PROTOCOL_TYPE_FIELD = "protocol_type"
 _SCHEMA_VERSION_FIELD = "schema_version"
 
+SOLVE_STATUSES = frozenset(
+    {
+        "unknown",
+        "optimal",
+        "feasible",
+        "infeasible",
+        "unbounded",
+        "no_solution",
+        "stopped",
+        "failed",
+    }
+)
+FEASIBILITY_STATUSES = frozenset({"unknown", "feasible", "infeasible"})
+
 
 def _protocol_header(type_name: str) -> dict[str, Any]:
     return {
@@ -63,7 +77,10 @@ def _encode_shared_value(value: Any, *, path: str) -> Any:
         return str(value)
     if isinstance(value, DataRef):
         return _encode_data_ref(value)
-    if isinstance(value, (Feedback, PopulationSnapshot, TrainerResult)):
+    if isinstance(
+        value,
+        (Feedback, PopulationSnapshot, TrainerResult, SolveQuality, SolverResult),
+    ):
         return value.as_dict()
     if isinstance(value, UnknownState):
         return _encode_shared_value(value.as_dict(), path=path)
@@ -106,6 +123,10 @@ def _decode_shared_value(value: Any) -> Any:
         return PopulationSnapshot.from_dict(payload)
     if protocol_type == "blackbase.trainer_result":
         return TrainerResult.from_dict(payload)
+    if protocol_type == "blackbase.solve_quality":
+        return SolveQuality.from_dict(payload)
+    if protocol_type == "blackbase.solver_result":
+        return SolverResult.from_dict(payload)
     return {str(key): _decode_shared_value(item) for key, item in payload.items()}
 
 
@@ -442,10 +463,293 @@ class TrainerResult:
         )
 
 
+@dataclass(frozen=True)
+class SolveQuality:
+    """Optional proof/approximation quality attached to a Solver terminal state."""
+
+    approximate: Optional[bool] = None
+    absolute_gap: Optional[float] = None
+    relative_gap: Optional[float] = None
+    bound: Optional[float] = None
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        approximate = self.approximate
+        if approximate is not None and not isinstance(approximate, (bool, np.bool_)):
+            raise TypeError("SolveQuality.approximate must be bool or None")
+        object.__setattr__(
+            self,
+            "approximate",
+            None if approximate is None else bool(approximate),
+        )
+        for name in ("absolute_gap", "relative_gap"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            normalized = float(value)
+            if not np.isfinite(normalized):
+                raise ValueError(f"SolveQuality.{name} must be finite")
+            if normalized < 0:
+                raise ValueError(f"SolveQuality.{name} must be non-negative")
+            object.__setattr__(self, name, normalized)
+        if self.bound is not None:
+            object.__setattr__(self, "bound", float(self.bound))
+        object.__setattr__(self, "metrics", dict(self.metrics or {}))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            **_protocol_header("solve_quality"),
+            "approximate": self.approximate,
+            "absolute_gap": self.absolute_gap,
+            "relative_gap": self.relative_gap,
+            "bound": self.bound,
+            "metrics": _encode_shared_value(
+                self.metrics,
+                path="solve_quality.metrics",
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any] | None) -> "SolveQuality":
+        data = dict(payload or {})
+        if data:
+            _validate_protocol_header(data, "solve_quality")
+        raw_approximate = data.get("approximate")
+        return cls(
+            approximate=raw_approximate,
+            absolute_gap=(
+                None
+                if data.get("absolute_gap") is None
+                else float(data.get("absolute_gap"))
+            ),
+            relative_gap=(
+                None
+                if data.get("relative_gap") is None
+                else float(data.get("relative_gap"))
+            ),
+            bound=None if data.get("bound") is None else float(data.get("bound")),
+            metrics=dict(_decode_shared_value(data.get("metrics", {})) or {}),
+        )
+
+
+@dataclass(frozen=True)
+class SolverResult:
+    """Versioned result payload for an optimization/search Case run.
+
+    The payload describes optimization outputs without selecting a Pareto
+    solution for the consumer.  Semantic layers may project ``best_solution``
+    or ``pareto_front`` according to an explicit policy.
+    """
+
+    best_solution: Any = None
+    best_objectives: Optional[np.ndarray] = None
+    best_constraint_violation: Optional[float] = None
+    pareto_front: Optional[PopulationSnapshot] = None
+    solve_status: str = "unknown"
+    termination_reason: str = "unknown"
+    feasibility: str = "unknown"
+    quality: SolveQuality = field(default_factory=SolveQuality)
+    history: tuple = ()
+    report: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    best_solution_ref: DataRef | None = None
+    pareto_front_ref: DataRef | None = None
+    history_ref: DataRef | None = None
+    artifact_refs: Mapping[str, DataRef] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.best_objectives is not None:
+            object.__setattr__(
+                self,
+                "best_objectives",
+                np.asarray(self.best_objectives, dtype=float).reshape(-1),
+            )
+        if self.best_constraint_violation is not None:
+            object.__setattr__(
+                self,
+                "best_constraint_violation",
+                float(self.best_constraint_violation),
+            )
+        solve_status = str(self.solve_status or "unknown").strip().lower()
+        if solve_status not in SOLVE_STATUSES:
+            raise ValueError(f"unsupported SolverResult solve_status '{solve_status}'")
+        feasibility = str(self.feasibility or "unknown").strip().lower()
+        if feasibility not in FEASIBILITY_STATUSES:
+            raise ValueError(f"unsupported SolverResult feasibility '{feasibility}'")
+        termination_reason = str(self.termination_reason or "unknown").strip().lower()
+        quality = self.quality
+        if not isinstance(quality, SolveQuality):
+            if not isinstance(quality, Mapping):
+                raise TypeError("SolverResult.quality must be SolveQuality-compatible")
+            quality = SolveQuality.from_dict(quality)
+        object.__setattr__(self, "solve_status", solve_status)
+        object.__setattr__(self, "termination_reason", termination_reason)
+        object.__setattr__(self, "feasibility", feasibility)
+        object.__setattr__(self, "quality", quality)
+        _validate_solver_result_consistency(
+            solve_status=solve_status,
+            feasibility=feasibility,
+            quality=quality,
+            best_constraint_violation=self.best_constraint_violation,
+        )
+        pareto_front = self.pareto_front
+        if pareto_front is not None and not isinstance(pareto_front, PopulationSnapshot):
+            pareto_front = PopulationSnapshot.from_dict(pareto_front)
+        object.__setattr__(self, "pareto_front", pareto_front)
+        object.__setattr__(self, "history", tuple(self.history or ()))
+        object.__setattr__(self, "report", dict(self.report or {}))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "best_solution_ref", _coerce_data_ref(self.best_solution_ref))
+        object.__setattr__(self, "pareto_front_ref", _coerce_data_ref(self.pareto_front_ref))
+        object.__setattr__(self, "history_ref", _coerce_data_ref(self.history_ref))
+        artifact_refs: dict[str, DataRef] = {}
+        for key, value in dict(self.artifact_refs or {}).items():
+            ref = _coerce_data_ref(value)
+            if ref is None:
+                raise TypeError(f"artifact_refs['{key}'] must be a DataRef")
+            artifact_refs[str(key)] = ref
+        object.__setattr__(self, "artifact_refs", artifact_refs)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            **_protocol_header("solver_result"),
+            "best_solution": (
+                None
+                if self.best_solution_ref is not None
+                else _encode_shared_value(
+                    self.best_solution,
+                    path="solver_result.best_solution",
+                )
+            ),
+            "best_solution_ref": (
+                None
+                if self.best_solution_ref is None
+                else _encode_data_ref(self.best_solution_ref)
+            ),
+            "best_objectives": (
+                None if self.best_objectives is None else self.best_objectives.tolist()
+            ),
+            "best_constraint_violation": self.best_constraint_violation,
+            "solve_status": self.solve_status,
+            "termination_reason": self.termination_reason,
+            "feasibility": self.feasibility,
+            "quality": self.quality.as_dict(),
+            "pareto_front": (
+                None
+                if self.pareto_front_ref is not None
+                else _encode_shared_value(
+                    self.pareto_front,
+                    path="solver_result.pareto_front",
+                )
+            ),
+            "pareto_front_ref": (
+                None
+                if self.pareto_front_ref is None
+                else _encode_data_ref(self.pareto_front_ref)
+            ),
+            "history": (
+                []
+                if self.history_ref is not None
+                else _encode_shared_value(self.history, path="solver_result.history")
+            ),
+            "history_ref": (
+                None if self.history_ref is None else _encode_data_ref(self.history_ref)
+            ),
+            "report": _encode_shared_value(self.report, path="solver_result.report"),
+            "metadata": _encode_shared_value(
+                self.metadata,
+                path="solver_result.metadata",
+            ),
+            "artifact_refs": {
+                str(key): _encode_data_ref(value)
+                for key, value in self.artifact_refs.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "SolverResult":
+        data = dict(payload or {})
+        _validate_protocol_header(data, "solver_result")
+        best_solution = _decode_shared_value(data.get("best_solution"))
+        if isinstance(best_solution, Mapping) and "values" in best_solution:
+            best_solution = UnknownState.from_protocol_payload(best_solution)
+        pareto_front = _decode_shared_value(data.get("pareto_front"))
+        return cls(
+            best_solution=best_solution,
+            best_objectives=(
+                None
+                if data.get("best_objectives") is None
+                else np.asarray(data.get("best_objectives"), dtype=float)
+            ),
+            best_constraint_violation=(
+                None
+                if data.get("best_constraint_violation") is None
+                else float(data.get("best_constraint_violation"))
+            ),
+            solve_status=str(data.get("solve_status", "unknown")),
+            termination_reason=str(data.get("termination_reason", "unknown")),
+            feasibility=str(data.get("feasibility", "unknown")),
+            quality=SolveQuality.from_dict(data.get("quality")),
+            pareto_front=pareto_front,
+            history=tuple(_decode_shared_value(data.get("history", ())) or ()),
+            report=dict(_decode_shared_value(data.get("report", {})) or {}),
+            metadata=dict(_decode_shared_value(data.get("metadata", {})) or {}),
+            best_solution_ref=_decode_shared_value(data.get("best_solution_ref")),
+            pareto_front_ref=_decode_shared_value(data.get("pareto_front_ref")),
+            history_ref=_decode_shared_value(data.get("history_ref")),
+            artifact_refs={
+                str(key): _decode_shared_value(value)
+                for key, value in dict(data.get("artifact_refs", {}) or {}).items()
+            },
+        )
+
+
+def _validate_solver_result_consistency(
+    *,
+    solve_status: str,
+    feasibility: str,
+    quality: SolveQuality,
+    best_constraint_violation: float | None,
+) -> None:
+    contradictory_statuses = {
+        ("optimal", "infeasible"),
+        ("feasible", "infeasible"),
+        ("infeasible", "feasible"),
+        ("no_solution", "feasible"),
+    }
+    if (solve_status, feasibility) in contradictory_statuses:
+        raise ValueError(
+            "inconsistent SolverResult terminal semantics: "
+            f"solve_status='{solve_status}', feasibility='{feasibility}'"
+        )
+    positive_gap = any(
+        value is not None and float(value) > 0.0
+        for value in (quality.absolute_gap, quality.relative_gap)
+    )
+    if quality.approximate is False and positive_gap:
+        raise ValueError(
+            "SolveQuality.approximate=False conflicts with a positive optimality gap"
+        )
+    if solve_status == "optimal" and positive_gap:
+        raise ValueError("solve_status='optimal' conflicts with a positive optimality gap")
+    if (
+        solve_status == "optimal"
+        and best_constraint_violation is not None
+        and float(best_constraint_violation) > 0.0
+    ):
+        raise ValueError(
+            "solve_status='optimal' conflicts with a positive best constraint violation"
+        )
+
+
 __all__ = [
     "SHARED_TYPE_SCHEMA_VERSION",
+    "SOLVE_STATUSES",
+    "FEASIBILITY_STATUSES",
     "Feedback",
     "UnknownState",
     "PopulationSnapshot",
     "TrainerResult",
+    "SolveQuality",
+    "SolverResult",
 ]

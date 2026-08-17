@@ -103,6 +103,17 @@ deadline/cancellation。预算通过可序列化 handle 委派，子 Case 未使
 - `Feedback`
 - `PopulationSnapshot`
 - `TrainerResult`
+- `SolverResult`
+
+`SolverResult` separates Case execution success from optimization semantics.
+Its typed terminal fields are `solve_status`, `termination_reason`,
+`feasibility`, and `SolveQuality` (approximation, gaps, bound, and metrics).
+`SolveQuality.approximate` is tri-state: `None` means no quality evidence,
+while `True`/`False` are explicit claims. Contradictory terminal states and
+quality claims are rejected by the codec.
+Best fields are optional and must be declared by the Solver; a Pareto front can
+be delivered inline or through a real `DataRef` published by the Project
+artifact authority.
 
 这些类型用于跨 `nsgablack` / `mlblack` Case surface 传递轻量候选状态和反馈，不承载任一语义层的私有逻辑。
 

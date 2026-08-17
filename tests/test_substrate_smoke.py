@@ -15,7 +15,7 @@ from blackbase.kernel import build_pipeline_kernel
 from blackbase.project.doctor import run_common_project_doctor
 from blackbase.project.execution import ProjectConfigurationError
 from blackbase.project.project_runner import execute_project, run_project
-from blackbase.project.runtime import case_import_context
+from blackbase.project.runtime import case_import_context, run_case
 from blackbase.project.scaffold import add_case, create_project
 from blackbase.resources import (
     InMemoryResourceScheduler,
@@ -32,6 +32,17 @@ from blackbase.resources import (
     WorkerDescriptor,
 )
 from blackbase.types import Feedback, UnknownState
+
+
+def test_run_case_applies_optional_semantic_result_exporter() -> None:
+    class _Case:
+        def run(self):
+            return {"raw_value": 3}
+
+        def export_case_result(self, raw_output):
+            return {"projected_value": int(raw_output["raw_value"]) + 1}
+
+    assert run_case(_Case(), case_kind="solver") == {"projected_value": 4}
 
 
 def test_resource_context_child_keeps_parent_lease_and_clamps_threads() -> None:

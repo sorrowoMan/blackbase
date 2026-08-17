@@ -785,7 +785,11 @@ def run_case(case_obj: Any, *, case_kind: str = "solver"):
     for name in order:
         fn = getattr(case_obj, name, None)
         if callable(fn):
-            return fn()
+            raw_output = fn()
+            exporter = getattr(case_obj, "export_case_result", None)
+            if callable(exporter):
+                return exporter(raw_output)
+            return raw_output
     return case_obj
 
 
