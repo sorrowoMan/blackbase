@@ -54,8 +54,10 @@ def test_strict_doctor_requires_case_build_check_contract(tmp_path) -> None:
     case_root = add_case("search", "solver", project_root=project_root)
     run_entry = case_root / "run_solver.py"
     run_entry.write_text(
-        run_entry.read_text(encoding="utf-8").replace("--check", "--inspect")
-        + "\n# Mentioning --check in a comment is not a CLI contract.\n",
+        "def main(argv=None):\n"
+        "    del argv\n"
+        "    return 0\n"
+        "\n# Mentioning --check in a comment is not a CLI contract.\n",
         encoding="utf-8",
     )
 

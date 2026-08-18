@@ -889,11 +889,13 @@ class CaseExecutor:
                 artifact_refs[name] = ref
             finished_at = time.time()
             resource_usage = {
-                "grant": (
+                "authorized_grant": (
                     request.child_grant.as_dict()
                     if request.child_grant is not None
                     else dict(request.resource_context.get("grant", {}) or {})
-                )
+                ),
+                "effective_context": dict(runtime_state.get("resource_context", {}) or {}),
+                "binding": dict(runtime_state.get("resource_binding", {}) or {}),
             }
             return CaseRunResult(
                 request=request,

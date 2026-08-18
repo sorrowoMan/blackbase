@@ -185,7 +185,7 @@ try:
     print("[OK] NSGABlack style imports work: InMemoryContextStore created")
     
     contract1 = ContextContract(requires=["a"], provides=["b"])
-    contract2 = ContextContract(context_requires=["a"], context_provides=["b"])
+    contract2 = ContextContract(requires=["a"], provides=["b"])
     print("[OK] Dual naming convention support works")
     
 except Exception as e:

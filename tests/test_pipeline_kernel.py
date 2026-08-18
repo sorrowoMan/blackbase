@@ -151,21 +151,21 @@ def test_shared_orchestrator_owns_switch_and_dynamic_modes() -> None:
         strict=True,
     )
 
-    switched = orchestrator._run_policy(
+    switched = orchestrator.run_policy(
         switch,
         np.array([0.0]),
         {"lane": 99},
         method="mutate",
         fallback=np.array([0.0]),
     )
-    early = orchestrator._run_policy(
+    early = orchestrator.run_policy(
         dynamic,
         np.array([0.0]),
         {"generation": 2},
         method="mutate",
         fallback=np.array([0.0]),
     )
-    late = orchestrator._run_policy(
+    late = orchestrator.run_policy(
         dynamic,
         np.array([0.0]),
         {"generation": 7},
@@ -355,13 +355,13 @@ def test_operator_body_type_error_is_not_retried_with_another_signature() -> Non
 def test_signature_binding_still_supports_zero_and_one_argument_operators() -> None:
     orchestrator = PipelineOrchestrator(strict=True)
 
-    assert orchestrator._call_operator(
+    assert orchestrator.call_operator(
         lambda value: value + 1,
         2,
         {},
         "transform",
     ) == 3
-    assert orchestrator._call_operator(
+    assert orchestrator.call_operator(
         lambda: 7,
         2,
         {},

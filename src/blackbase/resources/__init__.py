@@ -37,16 +37,22 @@ from .pool import (
     PoolScheduler,
     PoolTask,
     PoolResult,
-    PoolTaskResult,
 )
 from .transport import (
     ClaimedTask,
+    InMemoryTaskTransport,
     RedisTaskTransport,
     SQLiteTaskTransport,
     TaskLeaseError,
     TaskRecord,
     TaskTransport,
     TaskTransportError,
+)
+from .task_runtime import (
+    InMemoryTaskRuntimeBackend,
+    RedisTaskRuntimeBackend,
+    SQLiteTaskRuntimeBackend,
+    TaskRuntimeBackend,
 )
 from .lease_store import RedisLeaseStore, SQLiteLeaseStore
 from .budget import (
@@ -120,9 +126,9 @@ __all__ = [
     "PoolScheduler",
     "PoolTask",
     "PoolResult",
-    "PoolTaskResult",
     # transport
     "ClaimedTask",
+    "InMemoryTaskTransport",
     "RedisTaskTransport",
     "RedisLeaseStore",
     "SQLiteTaskTransport",
@@ -131,6 +137,10 @@ __all__ = [
     "TaskRecord",
     "TaskTransport",
     "TaskTransportError",
+    "TaskRuntimeBackend",
+    "InMemoryTaskRuntimeBackend",
+    "SQLiteTaskRuntimeBackend",
+    "RedisTaskRuntimeBackend",
     # shared run budgets
     "BudgetAccount",
     "BudgetClaim",

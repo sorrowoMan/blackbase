@@ -19,7 +19,7 @@ as needed.
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 
 class BiasBase(ABC):
@@ -30,7 +30,7 @@ class BiasBase(ABC):
 
     Optional hooks (all have defaults):
     - project_context — inject preference signals into context
-    - adjust — apply preference adjustment in multi-objective scenarios
+    - adjust_feedback — project evaluated feedback for selection/update
     - weight/enable management
     """
 
@@ -45,9 +45,25 @@ class BiasBase(ABC):
     context_cache: tuple = ()
     context_notes: str | None = None
 
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        weight: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        if name is not None:
+            self.name = str(name)
+        self.weight = float(weight)
+        self.enabled = bool(enabled)
+
     # --- Core: preference signal injection ---
 
-    def project_context(self, context: Mapping[str, Any]) -> Mapping[str, Any]:
+    def project_context(
+        self,
+        control: Any,
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
         """Inject preference signals into context.
 
         This is the primary mechanism for bias: express "what I prefer"
@@ -56,20 +72,29 @@ class BiasBase(ABC):
 
         Default: pass through without modification.
         """
+        del control
         return dict(context)
 
     # --- Optional: preference adjustment ---
 
-    def adjust(self, feedback: Any, context: Mapping[str, Any]) -> Any:
-        """Apply preference adjustment to feedback.
+    def adjust_feedback(
+        self,
+        control: Any,
+        candidates: Sequence[Any],
+        feedback: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> tuple[Any, ...]:
+        """Project evaluated feedback for selection or adapter update.
 
         Only meaningful in multi-objective scenarios where multiple
         equally-valid solutions exist (Pareto front). Does NOT change
-        the evaluation itself — only expresses relative preference.
+        the Problem evaluation itself — only the feedback consumed by the
+        selection policy.
 
         Default: pass through without modification.
         """
-        return feedback
+        del control, candidates, context
+        return tuple(feedback)
 
     # --- Weight / enable management ---
 

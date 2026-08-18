@@ -34,6 +34,33 @@ SOLVE_STATUSES = frozenset(
 )
 FEASIBILITY_STATUSES = frozenset({"unknown", "feasible", "infeasible"})
 
+_SOLVER_STATUS_RULES: Mapping[str, Mapping[str, Any]] = {
+    "optimal": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+        "forbids_approximate": True,
+        "forbids_positive_gap": True,
+        "forbids_infeasible_best": True,
+    },
+    "feasible": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+        "forbids_infeasible_best": True,
+    },
+    "infeasible": {
+        "forbidden_feasibility": frozenset({"feasible"}),
+        "forbids_feasible_best": True,
+    },
+    "unbounded": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+    },
+    "no_solution": {
+        "forbidden_feasibility": frozenset({"feasible"}),
+        "forbids_feasible_best": True,
+    },
+    "stopped": {},
+    "failed": {},
+    "unknown": {},
+}
+
 
 def _protocol_header(type_name: str) -> dict[str, Any]:
     return {
@@ -211,34 +238,16 @@ class Feedback:
         )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class UnknownState:
-    """
-    Numeric candidate state.
-
-    Compatibility note: old mlblack code used both `meta=` and `metadata=`.
-    BlackBase accepts both and exposes `.metadata` as an alias for `.meta`.
-    """
+    """Numeric candidate state with one canonical metadata field."""
 
     values: np.ndarray
-    meta: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __init__(
-        self,
-        values: Any,
-        meta: Optional[Mapping[str, Any]] = None,
-        *,
-        metadata: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        merged = dict(meta or {})
-        if metadata:
-            merged.update(dict(metadata))
-        object.__setattr__(self, "values", np.asarray(values, dtype=float))
-        object.__setattr__(self, "meta", merged)
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        return dict(self.meta)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", np.asarray(self.values, dtype=float))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -252,21 +261,21 @@ class UnknownState:
         return np.asarray(self.values, dtype=float)
 
     def with_values(self, values: Any, **metadata: Any) -> "UnknownState":
-        meta = dict(self.meta)
-        meta.update(metadata)
-        return UnknownState(values=np.asarray(values, dtype=float), meta=meta)
+        current_metadata = dict(self.metadata)
+        current_metadata.update(metadata)
+        return UnknownState(values=np.asarray(values, dtype=float), metadata=current_metadata)
 
     def with_meta(self, **metadata: Any) -> "UnknownState":
-        meta = dict(self.meta)
-        meta.update(metadata)
-        return UnknownState(values=self.values.copy(), meta=meta)
+        current_metadata = dict(self.metadata)
+        current_metadata.update(metadata)
+        return UnknownState(values=self.values.copy(), metadata=current_metadata)
 
     def to_protocol_payload(self) -> dict[str, Any]:
         """Return the stable, JSON-safe-codec input used by shared stores."""
         return {
             "version": 1,
             "values": self.as_array(),
-            "metadata": dict(self.meta),
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -280,7 +289,7 @@ class UnknownState:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {"values": self.as_array().tolist(), "metadata": dict(self.meta)}
+        return {"values": self.as_array().tolist(), "metadata": dict(self.metadata)}
 
 
 @dataclass(frozen=True)
@@ -565,10 +574,15 @@ class SolverResult:
                 np.asarray(self.best_objectives, dtype=float).reshape(-1),
             )
         if self.best_constraint_violation is not None:
+            best_constraint_violation = float(self.best_constraint_violation)
+            if not np.isfinite(best_constraint_violation):
+                raise ValueError(
+                    "SolverResult.best_constraint_violation must be finite"
+                )
             object.__setattr__(
                 self,
                 "best_constraint_violation",
-                float(self.best_constraint_violation),
+                best_constraint_violation,
             )
         solve_status = str(self.solve_status or "unknown").strip().lower()
         if solve_status not in SOLVE_STATUSES:
@@ -711,16 +725,33 @@ def _validate_solver_result_consistency(
     quality: SolveQuality,
     best_constraint_violation: float | None,
 ) -> None:
-    contradictory_statuses = {
-        ("optimal", "infeasible"),
-        ("feasible", "infeasible"),
-        ("infeasible", "feasible"),
-        ("no_solution", "feasible"),
-    }
-    if (solve_status, feasibility) in contradictory_statuses:
+    rules = _SOLVER_STATUS_RULES[solve_status]
+    forbidden_feasibility = rules.get("forbidden_feasibility", frozenset())
+    if feasibility in forbidden_feasibility:
         raise ValueError(
             "inconsistent SolverResult terminal semantics: "
             f"solve_status='{solve_status}', feasibility='{feasibility}'"
+        )
+    best_is_feasible = (
+        None
+        if best_constraint_violation is None
+        else float(best_constraint_violation) <= 0.0
+    )
+    if feasibility == "feasible" and best_is_feasible is False:
+        raise ValueError(
+            "a feasible SolverResult conflicts with a positive best constraint violation"
+        )
+    if feasibility == "infeasible" and best_is_feasible is True:
+        raise ValueError(
+            "an infeasible SolverResult conflicts with a feasible declared best"
+        )
+    if rules.get("forbids_infeasible_best") and best_is_feasible is False:
+        raise ValueError(
+            f"solve_status='{solve_status}' conflicts with a positive best constraint violation"
+        )
+    if rules.get("forbids_feasible_best") and best_is_feasible is True:
+        raise ValueError(
+            f"solve_status='{solve_status}' conflicts with a feasible declared best"
         )
     positive_gap = any(
         value is not None and float(value) > 0.0
@@ -730,16 +761,12 @@ def _validate_solver_result_consistency(
         raise ValueError(
             "SolveQuality.approximate=False conflicts with a positive optimality gap"
         )
-    if solve_status == "optimal" and positive_gap:
-        raise ValueError("solve_status='optimal' conflicts with a positive optimality gap")
-    if (
-        solve_status == "optimal"
-        and best_constraint_violation is not None
-        and float(best_constraint_violation) > 0.0
-    ):
+    if rules.get("forbids_approximate") and quality.approximate is True:
         raise ValueError(
-            "solve_status='optimal' conflicts with a positive best constraint violation"
+            "solve_status='optimal' conflicts with SolveQuality.approximate=True"
         )
+    if rules.get("forbids_positive_gap") and positive_gap:
+        raise ValueError("solve_status='optimal' conflicts with a positive optimality gap")
 
 
 __all__ = [

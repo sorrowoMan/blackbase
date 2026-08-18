@@ -9,7 +9,6 @@ Recommended imports:
 from __future__ import annotations
 
 from .context_keys import (
-    CONTEXT_KEY_ALIASES,
     CONTEXT_KEY_SET,
     METRIC_FALLBACKS,
     METRIC_KEYS,
@@ -78,12 +77,30 @@ from .snapshot_store import (
     unwrap_snapshot_payload,
     wrap_snapshot_payload,
 )
+from .value_isolation import detach_context_value
+from .storage_config import StateStoreConfig
+from .runtime_projection import (
+    RUNTIME_PROJECTION_AUDIT_MAX_BYTES,
+    RUNTIME_PROJECTION_COMPONENT_MAX_BYTES,
+    RUNTIME_PROJECTION_ERROR_TYPE_MAX_BYTES,
+    RUNTIME_PROJECTION_MAX_COMPONENTS,
+    RUNTIME_PROJECTION_MAX_ISSUE_SAMPLES,
+    RUNTIME_PROJECTION_MESSAGE_MAX_BYTES,
+    RUNTIME_PROJECTION_REASON_MAX_BYTES,
+    RUNTIME_PROJECTION_SCHEMA,
+    RUNTIME_PROJECTION_STATUSES,
+    RuntimeContextProjection,
+    RuntimeProjectionAggregation,
+    RuntimeProjectionComponent,
+    RuntimeProjectionIssue,
+    RuntimeProjectionIssueAccumulator,
+    aggregate_runtime_projections,
+)
 
 
 __all__ = [
     # context_keys
     "context_keys",
-    "CONTEXT_KEY_ALIASES",
     "CONTEXT_KEY_SET",
     "METRIC_FALLBACKS",
     "METRIC_KEYS",
@@ -151,4 +168,23 @@ __all__ = [
     "make_snapshot_key",
     "unwrap_snapshot_payload",
     "wrap_snapshot_payload",
+    # value isolation
+    "detach_context_value",
+    "StateStoreConfig",
+    # runtime projection
+    "RUNTIME_PROJECTION_SCHEMA",
+    "RUNTIME_PROJECTION_STATUSES",
+    "RUNTIME_PROJECTION_MAX_COMPONENTS",
+    "RUNTIME_PROJECTION_MAX_ISSUE_SAMPLES",
+    "RUNTIME_PROJECTION_AUDIT_MAX_BYTES",
+    "RUNTIME_PROJECTION_COMPONENT_MAX_BYTES",
+    "RUNTIME_PROJECTION_REASON_MAX_BYTES",
+    "RUNTIME_PROJECTION_ERROR_TYPE_MAX_BYTES",
+    "RUNTIME_PROJECTION_MESSAGE_MAX_BYTES",
+    "RuntimeProjectionIssue",
+    "RuntimeProjectionIssueAccumulator",
+    "RuntimeContextProjection",
+    "RuntimeProjectionComponent",
+    "RuntimeProjectionAggregation",
+    "aggregate_runtime_projections",
 ]

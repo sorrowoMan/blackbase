@@ -93,7 +93,7 @@ id 并与 transport 对账：
 
 ## nsgablack 兼容面
 
-`nsgablack.core.resources.RedisL0RuntimeBackend` 现在是统一 Redis
+`blackbase.resources.RedisL0RuntimeBackend` 是统一 Redis
 `TaskTransport` 的兼容 facade。旧的 `submit/claim/complete/get_result` 调用外形仍然保留，
 但 claim token 只能由同一个 worker 进程持有和完成。新的 worker 代码应优先使用
 `task_transport`、`claim_task()` 和 `complete_claim()`，以便显式处理 lease 与心跳。

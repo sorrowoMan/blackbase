@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
-import inspect
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
+
+from blackbase.call_binding import CallCandidate, invoke_bound_once
 
 
 # ============================================================================
@@ -653,7 +654,7 @@ class PipelineOrchestrator:
                 continue
             try:
                 self._raise_if_cancelled(context)
-                result = self._call_operator(op, result, context, method)
+                result = self.call_operator(op, result, context, method)
                 self._raise_if_cancelled(context)
             except PipelineCancellationError:
                 raise
@@ -730,7 +731,7 @@ class PipelineOrchestrator:
             if op is None:
                 return branch_value
             run_control.raise_if_cancelled()
-            result = self._call_operator(op, branch_value, branch_context, method)
+            result = self.call_operator(op, branch_value, branch_context, method)
             run_control.raise_if_cancelled()
             return result
 
@@ -880,18 +881,22 @@ class PipelineOrchestrator:
                     f"value={(context or {}).get(policy.selector_key)!r}"
                 )
             return fallback
-        result = self._call_operator(operator, value, context, method)
+        result = self.call_operator(operator, value, context, method)
         self._raise_if_cancelled(context)
         return result
     
-    def _call_operator(
+    def call_operator(
         self,
         operator: Any,
         value: Any,
         context: Optional[MutableMapping[str, Any]],
         method: str,
     ) -> Any:
-        """Call an operator with the given value and context."""
+        """Call one operator through the shared single-invocation contract.
+
+        Semantic facades in downstream frameworks may use this method without
+        depending on private implementation details of the shared kernel.
+        """
         # First support component objects whose semantics live in a slot
         # method such as initialize/mutate/repair rather than __call__.
         method_fn = getattr(operator, method, None)
@@ -916,24 +921,16 @@ class PipelineOrchestrator:
     ) -> Any:
         """Bind once, then invoke once so body TypeError is never retried."""
 
-        try:
-            signature = inspect.signature(fn)
-        except (TypeError, ValueError):
-            # Some extension/builtin callables do not expose a signature. Use
-            # the canonical richest form and preserve its original exception.
-            return fn(*tuple(candidates[0]))
-        for args in candidates:
-            try:
-                signature.bind(*args)
-            except TypeError:
-                continue
-            return fn(*args)
-        raise TypeError(
-            f"pipeline operator {fn!r} cannot bind any supported call form: "
-            "(value, context), (value), or ()"
+        labels = ("value_context", "value", "empty")
+        return invoke_bound_once(
+            fn,
+            tuple(
+                CallCandidate(args=tuple(args), label=labels[index])
+                for index, args in enumerate(candidates)
+            ),
         )
     
-    def _run_policy(
+    def run_policy(
         self,
         policy: OrchestrationPolicy,
         value: Any,
@@ -941,7 +938,7 @@ class PipelineOrchestrator:
         method: str,
         fallback: Any,
     ) -> Any:
-        """Run operators according to policy."""
+        """Run one public orchestration policy against ``value``."""
         mode = str(policy.mode or "serial").lower()
         
         if mode == "serial":
@@ -976,7 +973,6 @@ class PipelineOrchestrator:
         if bool(policy.strict):
             raise ValueError(f"unsupported orchestration mode: {mode!r}")
         return fallback
-
 
 # ============================================================================
 # Pipeline Kernel Build
@@ -1123,5 +1119,5 @@ def _make_slot_runner(
 ) -> Callable[[Any, Optional[MutableMapping[str, Any]]], Any]:
     """Create a slot runner function."""
     def _runner(value: Any, context: Optional[MutableMapping[str, Any]] = None) -> Any:
-        return orchestrator._run_policy(policy, value, context, method=method, fallback=value)
+        return orchestrator.run_policy(policy, value, context, method=method, fallback=value)
     return _runner

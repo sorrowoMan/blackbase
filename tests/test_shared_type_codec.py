@@ -182,6 +182,79 @@ def test_solver_result_rejects_nonzero_gap_for_optimal_status() -> None:
         )
 
 
+def test_solver_result_rejects_approximate_optimal_status() -> None:
+    with pytest.raises(ValueError, match="approximate=True"):
+        SolverResult(
+            solve_status="optimal",
+            feasibility="feasible",
+            quality=SolveQuality(approximate=True),
+        )
+
+
+@pytest.mark.parametrize("violation", (float("nan"), float("inf"), float("-inf")))
+def test_solver_result_rejects_non_finite_best_constraint_violation(
+    violation: float,
+) -> None:
+    with pytest.raises(ValueError, match="best_constraint_violation must be finite"):
+        SolverResult(best_constraint_violation=violation)
+
+
+@pytest.mark.parametrize(
+    ("solve_status", "feasibility"),
+    (
+        ("optimal", "feasible"),
+        ("feasible", "feasible"),
+        ("feasible", "unknown"),
+        ("stopped", "feasible"),
+    ),
+)
+def test_solver_result_rejects_infeasible_declared_best_for_feasible_result(
+    solve_status: str,
+    feasibility: str,
+) -> None:
+    with pytest.raises(ValueError, match="positive best constraint violation"):
+        SolverResult(
+            best_solution=UnknownState([1.0]),
+            best_objectives=[1.0],
+            best_constraint_violation=0.1,
+            solve_status=solve_status,
+            feasibility=feasibility,
+        )
+
+
 def test_solver_result_allows_stopped_feasible_and_unbounded_feasible() -> None:
     assert SolverResult(solve_status="stopped", feasibility="feasible")
     assert SolverResult(solve_status="unbounded", feasibility="feasible")
+    assert SolverResult(
+        solve_status="stopped",
+        feasibility="infeasible",
+        best_constraint_violation=0.1,
+    )
+
+
+@pytest.mark.parametrize("solve_status", ("infeasible", "no_solution"))
+def test_solver_result_rejects_feasible_best_for_status_without_solution(
+    solve_status: str,
+) -> None:
+    with pytest.raises(ValueError, match="feasible declared best"):
+        SolverResult(
+            solve_status=solve_status,
+            feasibility=("infeasible" if solve_status == "infeasible" else "unknown"),
+            best_constraint_violation=0.0,
+        )
+
+
+def test_solver_result_rejects_unbounded_infeasible_combination() -> None:
+    with pytest.raises(ValueError, match="inconsistent SolverResult"):
+        SolverResult(solve_status="unbounded", feasibility="infeasible")
+
+
+def test_solver_result_allows_failed_result_with_pre_failure_incumbent() -> None:
+    result = SolverResult(
+        solve_status="failed",
+        feasibility="feasible",
+        best_constraint_violation=0.0,
+    )
+
+    assert result.solve_status == "failed"
+    assert result.feasibility == "feasible"

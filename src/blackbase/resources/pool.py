@@ -27,19 +27,6 @@ from .probe import build_local_worker_descriptor, detect_local_resource_offer
 T = TypeVar("T")
 
 
-@dataclass(frozen=True)
-class PoolTaskResult(Generic[T]):
-    """Legacy-compatible completed task payload."""
-
-    task_id: str
-    result: T
-    worker_id: str
-    ok: bool = True
-    error: str = ""
-    started_at: float = 0.0
-    finished_at: float = 0.0
-
-
 class PoolTask(Generic[T]):
     """Task submitted to the shared local pool."""
 
@@ -105,13 +92,11 @@ class PoolResult(Generic[T]):
         worker_id: str,
         *,
         task_id: str = "",
-        legacy_result: bool = False,
         cancel_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.task = task
         self.worker_id = str(worker_id)
         self.task_id = str(task_id or "")
-        self.legacy_result = bool(legacy_result)
         self._cancel_callback = cancel_callback
         self._future: Optional[Future[Any]] = None
         self.start_time: Optional[float] = None
@@ -121,17 +106,8 @@ class PoolResult(Generic[T]):
     def done(self) -> bool:
         return self.task.done
 
-    def result(self, timeout: Optional[float] = None) -> T | PoolTaskResult[T]:
-        raw = self.task.result(timeout=timeout)
-        if self.legacy_result:
-            return PoolTaskResult(
-                task_id=str(self.task_id or ""),
-                result=raw,
-                worker_id=str(self.worker_id),
-                started_at=float(self.start_time or 0.0),
-                finished_at=float(self.end_time or 0.0),
-            )
-        return raw
+    def result(self, timeout: Optional[float] = None) -> T:
+        return self.task.result(timeout=timeout)
 
     def cancel(self) -> bool:
         cancelled = self.task.cancel()
@@ -204,42 +180,28 @@ class PoolScheduler:
             )
             self._capacity_changed.notify_all()
 
-    def submit(self, *args: Any, **kwargs: Any) -> PoolResult[Any]:
-        """
-        Submit a task.
-
-        Supported forms:
-        - new/shared: `submit(fn, *args, **kwargs)` returns raw `fn` result
-        - legacy nsgablack: `submit(task_id, workers, fn, *args, **kwargs)`
-          returns a `PoolTaskResult` from `.result()`
-        """
-        if args and callable(args[0]):
-            legacy = False
-            task_id = ""
-            workers = 1
-            fn = args[0]
-            task_args = args[1:]
-        elif len(args) >= 3 and callable(args[2]):
-            legacy = True
-            task_id = str(args[0])
-            workers = max(1, int(args[1] or 1))
-            fn = args[2]
-            task_args = args[3:]
-        else:
-            raise TypeError("submit expects (fn, *args) or (task_id, workers, fn, *args)")
-
-        permit_count = max(1, min(int(workers), self._total_threads))
+    def submit(
+        self,
+        fn: Callable[..., T],
+        *args: Any,
+        resource_permits: int = 1,
+        task_id: str = "",
+        **kwargs: Any,
+    ) -> PoolResult[T]:
+        """Submit one callable using an explicit local capacity grant."""
+        if not callable(fn):
+            raise TypeError("fn must be callable")
+        permit_count = max(1, min(int(resource_permits), self._total_threads))
         if int(getattr(self._task_local, "held_permits", 0)) > 0:
             raise RuntimeError(
                 "submit cannot be called from a task running in the same "
                 "PoolScheduler; derive a child resource context instead"
             )
-        task: PoolTask[Any] = PoolTask(fn, *task_args, **kwargs)
+        task: PoolTask[T] = PoolTask(fn, *args, **kwargs)
         result = PoolResult(
             task,
             worker_id="",
-            task_id=task_id,
-            legacy_result=legacy,
+            task_id=str(task_id or ""),
             cancel_callback=self._notify_capacity_waiters,
         )
 
@@ -257,7 +219,7 @@ class PoolScheduler:
                 ident = threading.get_ident()
                 result.worker_id = f"pool-{ident}"
                 self._task_local.held_permits = previous_permits + permit_count
-                raw_result = fn(*task_args, **kwargs)
+                raw_result = fn(*args, **kwargs)
                 task._set_result(raw_result)
                 with self._lock:
                     self._tasks_completed += 1
@@ -474,5 +436,4 @@ __all__ = [
     "PoolScheduler",
     "PoolTask",
     "PoolResult",
-    "PoolTaskResult",
 ]

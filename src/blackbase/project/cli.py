@@ -17,11 +17,6 @@ def add_project_subcommands(
 
     sub = parser.add_subparsers(dest="project_command", required=True)
 
-    p_init = sub.add_parser("init", help="Create a local project scaffold")
-    p_init.add_argument("path", help="Target directory for the project")
-    p_init.add_argument("--force", action="store_true", help="Overwrite existing directory")
-    p_init.set_defaults(project_action="init")
-
     p_new = sub.add_parser("new", help="Create a new project scaffold")
     p_new.add_argument("project_name", help="Name/path of the new project directory")
     p_new.add_argument("--force", action="store_true", help="Overwrite existing directory")
@@ -98,10 +93,6 @@ def handle_project_command(
     """Dispatch one common project subcommand."""
 
     action = str(getattr(args, "project_action", getattr(args, "project_command", "")))
-    if action == "init":
-        root = create_project(Path(args.path), force=bool(getattr(args, "force", False)))
-        print(f"Project created at: {root}")
-        return 0
     if action == "new":
         root = create_project(Path(args.project_name), force=bool(getattr(args, "force", False)))
         print(f"Project created at: {root}")

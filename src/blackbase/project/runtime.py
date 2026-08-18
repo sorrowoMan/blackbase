@@ -38,6 +38,8 @@ from blackbase.resources import (
     TerminationPolicy,
 )
 
+from .case_binding import bind_case_resource_context
+
 
 _CASE_LOCAL_MODULE_ROOTS = {
     "adapter",
@@ -90,7 +92,7 @@ def text_declares_check_argument(text: str) -> bool:
 
 
 def path_declares_check_argument(path: Path | str) -> bool:
-    """Resolve a ``--check`` contract declared directly or by a called build-entry delegate."""
+    """Resolve a direct or formally delegated ``--check`` CLI contract."""
 
     run_entry = Path(path)
     try:
@@ -103,6 +105,23 @@ def path_declares_check_argument(path: Path | str) -> bool:
         tree = ast.parse(source)
     except SyntaxError:
         return False
+
+    shared_cli_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module not in {"blackbase.project", "blackbase.project.case_cli"}:
+            continue
+        for alias in node.names:
+            if alias.name == "run_standard_case_cli":
+                shared_cli_names.add(str(alias.asname or alias.name))
+    if shared_cli_names and any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in shared_cli_names
+        for node in ast.walk(tree)
+    ):
+        return True
 
     delegated_names: set[str] = set()
     for node in ast.walk(tree):
@@ -573,8 +592,8 @@ def project_import_context(*import_paths: Path | str) -> Iterator[tuple[Path, ..
 @contextmanager
 def _project_import_context(import_paths: Sequence[Path | str]) -> Iterator[tuple[Path, ...]]:
     resolved = tuple(Path(path).resolve() for path in import_paths)
-    # sys.path and sys.modules are process-global. Serializing this compatibility
-    # context prevents two in-process external workers from importing different
+    # sys.path and sys.modules are process-global. Serializing this import scope
+    # prevents two in-process external workers from importing different
     # projects through the same short ``cases.*`` module names.
     with _PROJECT_IMPORT_LOCK:
         inserted = _prepend_sys_path(resolved)
@@ -599,7 +618,7 @@ def _case_import_context(
     *,
     extra_import_paths: Sequence[Path | str] = (),
 ) -> Iterator[Path]:
-    """Make one Project/Case scaffold importable with legacy-local isolation."""
+    """Make one Project/Case scaffold importable with project-local isolation."""
 
     root = Path(project_root).resolve()
     case_root = root / "cases" / str(case_name)
@@ -772,10 +791,12 @@ def build_case(
             "canonical Case builder must accept keyword parameters "
             f"resource_context and component_overrides; missing={missing}"
         )
-    return builder(
+    case_obj = builder(
         resource_context=payload,
         component_overrides=overrides,
     )
+    bind_case_resource_context(case_obj, payload)
+    return case_obj
 
 
 def run_case(case_obj: Any, *, case_kind: str = "solver"):

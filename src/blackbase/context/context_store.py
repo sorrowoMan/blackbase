@@ -8,14 +8,17 @@ backend to be switched (in-memory by default, Redis optionally).
 from __future__ import annotations
 
 import pickle
+import threading
 import warnings
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 
 class _ContextStoreABC(ABC):
     """Abstract context key-value store."""
+
+    supports_atomic_patch: bool = False
     
     @abstractmethod
     def get(self, key: str, default: Any = None) -> Any:
@@ -44,8 +47,30 @@ class _ContextStoreABC(ABC):
     
     def update(self, values: Dict[str, Any], *, ttl_seconds: Optional[float] = None) -> None:
         """Update multiple values at once."""
+        if self.supports_atomic_patch:
+            self.apply_patch(values, ttl_seconds=ttl_seconds)
+            return
         for key, value in values.items():
             self.set(str(key), value, ttl_seconds=ttl_seconds)
+
+    def apply_patch(
+        self,
+        values: Mapping[str, Any],
+        *,
+        delete_keys: Iterable[str] = (),
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
+        """Atomically apply a set/delete patch when the backend supports it.
+
+        Custom stores must override this method and set
+        ``supports_atomic_patch = True`` before callers may rely on atomic
+        visibility.  The built-in memory and Redis backends provide that
+        guarantee.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support atomic context patches"
+        )
 
     def __getitem__(self, key: str) -> Any:
         missing = object()
@@ -84,11 +109,14 @@ class _ContextStoreABC(ABC):
 
 class InMemoryContextStore(_ContextStoreABC):
     """Default context store backend - in-memory implementation."""
+
+    supports_atomic_patch = True
     
     def __init__(self, *, default_ttl_seconds: Optional[float] = None) -> None:
         self.default_ttl_seconds = default_ttl_seconds
         self._data: Dict[str, Any] = {}
         self._expires_at: Dict[str, float] = {}
+        self._lock = threading.RLock()
     
     def _effective_ttl(self, ttl_seconds: Optional[float]) -> Optional[float]:
         """Get effective TTL considering default."""
@@ -109,59 +137,90 @@ class InMemoryContextStore(_ContextStoreABC):
             self._data.pop(key, None)
     
     def get(self, key: str, default: Any = None) -> Any:
-        self._sweep_expired()
-        return self._data.get(str(key), default)
+        with self._lock:
+            self._sweep_expired()
+            return self._data.get(str(key), default)
     
     def set(self, key: str, value: Any, *, ttl_seconds: Optional[float] = None) -> None:
-        self._sweep_expired()
-        k = str(key)
-        self._data[k] = value
-        ttl = self._effective_ttl(ttl_seconds)
-        if ttl is not None and ttl > 0:
-            self._expires_at[k] = time.time() + ttl
-        else:
-            self._expires_at.pop(k, None)
+        with self._lock:
+            self._sweep_expired()
+            k = str(key)
+            self._data[k] = value
+            ttl = self._effective_ttl(ttl_seconds)
+            if ttl is not None and ttl > 0:
+                self._expires_at[k] = time.time() + ttl
+            else:
+                self._expires_at.pop(k, None)
     
     def delete(self, key: str) -> None:
-        k = str(key)
-        self._data.pop(k, None)
-        self._expires_at.pop(k, None)
+        with self._lock:
+            k = str(key)
+            self._data.pop(k, None)
+            self._expires_at.pop(k, None)
     
     def clear(self) -> None:
-        self._data.clear()
-        self._expires_at.clear()
+        with self._lock:
+            self._data.clear()
+            self._expires_at.clear()
     
     def snapshot(self) -> Dict[str, Any]:
-        self._sweep_expired()
-        return dict(self._data)
+        with self._lock:
+            self._sweep_expired()
+            return dict(self._data)
+
+    def apply_patch(
+        self,
+        values: Mapping[str, Any],
+        *,
+        delete_keys: Iterable[str] = (),
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
+        normalized_values = {str(key): value for key, value in values.items()}
+        normalized_deletes = tuple(str(key) for key in delete_keys)
+        ttl = self._effective_ttl(ttl_seconds)
+        expires_at = time.time() + ttl if ttl is not None and ttl > 0 else None
+        with self._lock:
+            self._sweep_expired()
+            next_data = dict(self._data)
+            next_expiry = dict(self._expires_at)
+            for key in normalized_deletes:
+                next_data.pop(key, None)
+                next_expiry.pop(key, None)
+            for key, value in normalized_values.items():
+                next_data[key] = value
+                if expires_at is None:
+                    next_expiry.pop(key, None)
+                else:
+                    next_expiry[key] = expires_at
+            self._data = next_data
+            self._expires_at = next_expiry
     
     def __iter__(self):
-        self._sweep_expired()
-        return iter(self._data.keys())
+        return iter(self.snapshot())
     
     def items(self):
-        self._sweep_expired()
-        return self._data.items()
+        return self.snapshot().items()
     
     def keys(self):
-        self._sweep_expired()
-        return self._data.keys()
+        return self.snapshot().keys()
     
     def values(self):
-        self._sweep_expired()
-        return self._data.values()
+        return self.snapshot().values()
 
     def __getitem__(self, key: str) -> Any:
-        self._sweep_expired()
-        return self._data[str(key)]
+        with self._lock:
+            self._sweep_expired()
+            return self._data[str(key)]
 
     def __contains__(self, key: str) -> bool:
-        self._sweep_expired()
-        return str(key) in self._data
+        with self._lock:
+            self._sweep_expired()
+            return str(key) in self._data
 
     def __len__(self) -> int:
-        self._sweep_expired()
-        return len(self._data)
+        with self._lock:
+            self._sweep_expired()
+            return len(self._data)
 
 
 class ContextStore(InMemoryContextStore):
@@ -176,6 +235,8 @@ class ContextStore(InMemoryContextStore):
 
 class RedisContextStore(_ContextStoreABC):
     """Redis-backed context store (optional dependency)."""
+
+    supports_atomic_patch = True
     
     def __init__(
         self,
@@ -234,6 +295,36 @@ class RedisContextStore(_ContextStoreABC):
     
     def delete(self, key: str) -> None:
         self._redis.delete(self._k(key))
+
+    def apply_patch(
+        self,
+        values: Mapping[str, Any],
+        *,
+        delete_keys: Iterable[str] = (),
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
+        normalized_values = {str(key): value for key, value in values.items()}
+        normalized_deletes = tuple(str(key) for key in delete_keys)
+        serialized: Dict[str, bytes] = {}
+        for key, value in normalized_values.items():
+            try:
+                serialized[key] = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as exc:
+                raise ValueError(
+                    f"RedisContextStore failed to serialize value for key {key!r}"
+                ) from exc
+
+        ttl = self._effective_ttl(ttl_seconds)
+        pipeline = self._redis.pipeline(transaction=True)
+        for key in normalized_deletes:
+            pipeline.delete(self._k(key))
+        for key, payload in serialized.items():
+            redis_key = self._k(key)
+            if ttl is None:
+                pipeline.set(redis_key, payload)
+            else:
+                pipeline.setex(redis_key, ttl, payload)
+        pipeline.execute()
     
     def clear(self) -> None:
         pattern = f"{self._key_prefix}:*"

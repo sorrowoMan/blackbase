@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from .case_binding import case_resource_binding_audit
+
 
 _RESOURCE_KEYS = (
     "device",
@@ -62,6 +64,7 @@ def build_case_check_payload(
         "providers": [_component_name(provider) for provider in providers],
         "plugins": [_component_name(plugin) for plugin in plugins],
         "resource_context": _safe_resource_context(effective_resource_context),
+        "resource_binding": case_resource_binding_audit(case),
     }
 
 

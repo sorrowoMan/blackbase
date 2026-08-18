@@ -12,7 +12,7 @@ from .context_keys import CONTEXT_KEY_SET
 
 
 CONTEXT_FIELD_SCHEMA_NAME = "blackbase.context_field.v1"
-CONTEXT_FIELD_SCHEMA_VERSION = "1.0.0"
+CONTEXT_FIELD_SCHEMA_VERSION = "1.1.0"
 
 
 def context_field_schema_dict() -> Dict[str, str]:
