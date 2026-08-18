@@ -32,10 +32,13 @@ Project 运行时和 Doctor 始终加载、校验规范入口；`kind=trainer` �
 ### Context / Snapshot
 
 - `ContextStore` / `create_context_store`
+- built-in ContextStore backends expose atomic `apply_patch(set/delete)` updates
 - `SnapshotStore` / `create_snapshot_store`
 - `ContextContract`
 - canonical context key registry
 - context schema / replay helpers
+- canonical `best_candidate_ref` for keeping oversized incumbent candidates in SnapshotStore
+- canonical Adapter-local best projection keys: `adapter_best_x`, `adapter_best_objectives`, `adapter_best_score`
 
 ### L0 Resources
 
@@ -110,12 +113,28 @@ Its typed terminal fields are `solve_status`, `termination_reason`,
 `feasibility`, and `SolveQuality` (approximation, gaps, bound, and metrics).
 `SolveQuality.approximate` is tri-state: `None` means no quality evidence,
 while `True`/`False` are explicit claims. Contradictory terminal states and
-quality claims are rejected by the codec.
+quality claims are rejected by one centralized status-rule matrix. Feasibility
+evidence is checked in both directions: feasible semantics cannot attach a
+positive best violation, while `infeasible`/`no_solution` cannot attach a
+feasible authoritative best; `unbounded + infeasible` is also rejected.
 Best fields are optional and must be declared by the Solver; a Pareto front can
 be delivered inline or through a real `DataRef` published by the Project
 artifact authority.
 
 这些类型用于跨 `nsgablack` / `mlblack` Case surface 传递轻量候选状态和反馈，不承载任一语义层的私有逻辑。
+
+## 共享协议版本
+
+当前三仓共享底座基线为 `blackbase 0.3.x`。`nsgablack` 与 `mlblack`
+必须声明 `blackbase>=0.3.0,<0.4.0`。
+
+0.3 完成了共享底座的干净边界：删除两侧资源、Context 与 Adapter 转发树；
+公共调用绑定、Pipeline 编排、Catalog、Case stage、任务运行后端均由 BlackBase
+直接提供。Adapter 的唯一运行投影入口是
+`get_runtime_context_projection(control)`，组合投影的健康、因果摘要和叶子 writer
+来源均进入有界正式信封。具体破坏性变更见 [MIGRATION.md](MIGRATION.md)。
+
+包版本、共享类型 wire schema 与 Context schema 分别演进，不能互相代替。
 
 ## 安装
 
