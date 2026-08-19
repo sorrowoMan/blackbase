@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blackbase"
-version = "0.2.0"
+version = "0.3.3"
 description = "Shared foundation for NSGABlack and MLBlack frameworks"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.21",
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import shutil
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
+
+
+ComponentTemplateProvider = Callable[[str, str, str | None], str]
 
 
 _COMPONENT_KIND_TO_DIR = {
@@ -99,6 +102,7 @@ def add_component(
     slot: str | None = None,
     project_root: Path | str | None = None,
     framework: str = "blackbase",
+    template_providers: Mapping[str, ComponentTemplateProvider] | None = None,
 ) -> Path | None:
     root = Path(project_root).resolve() if project_root is not None else Path.cwd().resolve()
     case_root = _resolve_case_root(root, case_name=case_name)
@@ -131,7 +135,16 @@ def add_component(
         print(f"Error: Component file already exists: {target_file}")
         return None
 
-    target_file.write_text(_component_template(safe_name, kind, slot=pipeline_slot, framework=framework), encoding="utf-8")
+    target_file.write_text(
+        _component_template(
+            safe_name,
+            kind,
+            slot=pipeline_slot,
+            framework=framework,
+            template_providers=template_providers,
+        ),
+        encoding="utf-8",
+    )
     slot_suffix = f" (slot={pipeline_slot})" if pipeline_slot is not None else ""
     print(
         f"Successfully added {kind} component '{safe_name}' "
@@ -154,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_component.add_argument("--kind", choices=tuple(sorted(_COMPONENT_KIND_TO_DIR)), required=True)
     p_component.add_argument("--name", required=True)
     p_component.add_argument("--slot", default=None)
-    p_component.add_argument("--framework", choices=("blackbase", "nsgablack", "mlblack"), default="blackbase")
+    p_component.add_argument("--framework", default="blackbase")
     return parser
 
 
@@ -239,7 +252,7 @@ def _ensure_primary_entries(case_path: Path, *, case_kind: str, framework: str =
 
 
 def _ensure_alias_entries(case_path: Path) -> None:
-    """Create trainer-named compatibility aliases without a second entry implementation."""
+    """Create the required trainer-named thin aliases without a second implementation."""
 
     alias_build = case_path / "build_trainer.py"
     if not alias_build.is_file():
@@ -327,7 +340,7 @@ def _detect_framework(case_root: Path) -> str:
             if line.strip().startswith("framework"):
                 _, _, value = line.partition("=")
                 fw = value.strip()
-                if fw in _FRAMEWORK_COMPONENT_TEMPLATES:
+                if fw:
                     return fw
     return "blackbase"
 
@@ -375,13 +388,31 @@ def _ensure_package_tree(case_root: Path, target_dir: Path) -> None:
             init_file.write_text("", encoding="utf-8")
 
 
-def _component_template(component_name: str, component_kind: str, *, slot: str | None = None, framework: str = "blackbase") -> str:
+def _component_template(
+    component_name: str,
+    component_kind: str,
+    *,
+    slot: str | None = None,
+    framework: str = "blackbase",
+    template_providers: Mapping[str, ComponentTemplateProvider] | None = None,
+) -> str:
     if component_kind == "pipeline":
         return _pipeline_component_template(component_name, slot=slot)
+    provider = dict(template_providers or {}).get(str(framework or "blackbase"))
+    if provider is not None:
+        return provider(component_name, component_kind, slot)
+    if str(framework or "blackbase") != "blackbase":
+        raise ValueError(
+            f"framework {framework!r} must provide its semantic component template provider"
+        )
     class_name = "".join(part.capitalize() for part in component_name.split("_") if part) or "Component"
-    return _FRAMEWORK_COMPONENT_TEMPLATES.get(framework, _FRAMEWORK_COMPONENT_TEMPLATES["blackbase"]).get(
-        component_kind, _FRAMEWORK_COMPONENT_TEMPLATES["blackbase"]
-    )(class_name, component_name, component_kind)
+    providers = {
+        "problem": _blackbase_problem_template,
+        "adapter": _blackbase_adapter_template,
+        "bias": _blackbase_bias_template,
+        "plugin": _blackbase_plugin_template,
+    }
+    return providers[component_kind](class_name, component_name, component_kind)
 
 
 def _blackbase_problem_template(class_name: str, component_name: str, kind: str) -> str:
@@ -427,123 +458,6 @@ def _blackbase_plugin_template(class_name: str, component_name: str, kind: str) 
         f'    """TODO: implement plugin lifecycle hooks."""\n\n'
         f"    pass\n"
     )
-
-
-def _nsgablack_problem_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from nsgablack.core.base import BlackBoxProblem\n\n\n"
-        f"class {class_name}(BlackBoxProblem):\n"
-        f'    """TODO: implement evaluation logic."""\n\n'
-        f"    def evaluate(self, candidate, context=None):\n"
-        f'        raise NotImplementedError("TODO: implement evaluate")\n'
-    )
-
-
-def _nsgablack_adapter_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from nsgablack.adapters.algorithm_adapter import AlgorithmAdapter\n\n\n"
-        f"class {class_name}(AlgorithmAdapter):\n"
-        f'    """TODO: implement propose/update logic."""\n\n'
-        f"    def __init__(self, name=None, **kwargs):\n"
-        f"        super().__init__(name=name or '{component_name}', **kwargs)\n\n"
-        f"    def propose(self, control, context):\n"
-        f'        raise NotImplementedError("TODO: implement propose")\n\n'
-        f"    def update(self, control, candidates, feedback, context):\n"
-        f"        objectives, violations = feedback\n"
-        f'        raise NotImplementedError("TODO: implement update")\n'
-    )
-
-
-def _nsgablack_bias_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from nsgablack.bias.core.base import BiasBase\n\n\n"
-        f"class {class_name}(BiasBase):\n"
-        f'    """TODO: implement preference logic."""\n\n'
-        f"    def __init__(self, **kwargs):\n"
-        f"        super().__init__(name='{component_name}', **kwargs)\n\n"
-        f"    def compute(self, candidate, context):\n"
-        f"        return 0.0\n"
-    )
-
-
-def _nsgablack_plugin_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from blackbase.plugin import Plugin\n\n\n"
-        f"class {class_name}(Plugin):\n"
-        f'    """TODO: implement plugin lifecycle hooks."""\n\n'
-        f"    pass\n"
-    )
-
-
-def _mlblack_problem_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from mlblack.core.problem import LearningProblem\n\n\n"
-        f"class {class_name}(LearningProblem):\n"
-        f'    """TODO: implement evaluation logic."""\n\n'
-        f"    def evaluate(self, candidate, context=None):\n"
-        f'        raise NotImplementedError("TODO: implement evaluate")\n'
-    )
-
-
-def _mlblack_adapter_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from mlblack.core.adapter import OptimizerAdapter\n\n\n"
-        f"class {class_name}(OptimizerAdapter):\n"
-        f'    """TODO: implement propose/update logic."""\n\n'
-        f"    def propose(self, control, context):\n"
-        f'        raise NotImplementedError("TODO: implement propose")\n\n'
-        f"    def update(self, control, candidates, feedback, context):\n"
-        f'        raise NotImplementedError("TODO: implement update")\n'
-    )
-
-
-def _mlblack_bias_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from mlblack.bias.base import OptimizationBias\n\n\n"
-        f"class {class_name}(OptimizationBias):\n"
-        f'    """TODO: implement preference logic."""\n\n'
-        f"    def project_context(self, context):\n"
-        f"        return dict(context)\n"
-    )
-
-
-def _mlblack_plugin_template(class_name: str, component_name: str, kind: str) -> str:
-    return (
-        f'"""Auto-generated {kind} component: {component_name}."""\n\n'
-        f"from blackbase.plugin import PluginBase\n\n\n"
-        f"class {class_name}(PluginBase):\n"
-        f'    """TODO: implement capability lifecycle hooks."""\n\n'
-        f"    pass\n"
-    )
-
-
-_FRAMEWORK_COMPONENT_TEMPLATES = {
-    "blackbase": {
-        "problem": _blackbase_problem_template,
-        "adapter": _blackbase_adapter_template,
-        "bias": _blackbase_bias_template,
-        "plugin": _blackbase_plugin_template,
-    },
-    "nsgablack": {
-        "problem": _nsgablack_problem_template,
-        "adapter": _nsgablack_adapter_template,
-        "bias": _nsgablack_bias_template,
-        "plugin": _nsgablack_plugin_template,
-    },
-    "mlblack": {
-        "problem": _mlblack_problem_template,
-        "adapter": _mlblack_adapter_template,
-        "bias": _mlblack_bias_template,
-        "plugin": _mlblack_plugin_template,
-    },
-}
 
 
 def _pipeline_component_template(component_name: str, *, slot: str | None) -> str:
@@ -721,28 +635,10 @@ if __name__ == "__main__":
 
 def _build_entry_template(kind: str, framework: str = "blackbase") -> str:
     func = "build_solver"
-    # Framework-specific import hints
-    if framework == "nsgablack":
-        imports = (
-            "from nsgablack.core.base import BlackBoxProblem\n"
-            "from nsgablack.adapters.algorithm_adapter import AlgorithmAdapter\n"
-            "from nsgablack.representation.base import RepresentationPipeline\n"
-            "from nsgablack.bias.core.base import BiasBase\n"
-            "from blackbase.plugin import Plugin\n"
-        )
-    elif framework == "mlblack":
-        imports = (
-            "from mlblack.core.problem import LearningProblem\n"
-            "from mlblack.core.adapter import OptimizerAdapter\n"
-            "from mlblack.core.representation import ModelRepresentation\n"
-            "from mlblack.bias.base import OptimizationBias\n"
-            "from blackbase.plugin import PluginBase\n"
-        )
-    else:
-        imports = (
-            "from blackbase.abc import AdapterBase, RepresentationBase, ProblemBase, BiasBase\n"
-            "from blackbase.plugin import PluginBase\n"
-        )
+    imports = (
+        "from blackbase.abc import AdapterBase, RepresentationBase, ProblemBase, BiasBase\n"
+        "from blackbase.plugin import PluginBase\n"
+    )
     return f'''"""Canonical {kind} case assembly entry ({framework})."""
 
 {imports}
@@ -762,32 +658,13 @@ def {func}(*, resource_context=None, component_overrides=None):
 
 
 def _run_entry_template(kind: str, *, framework: str = "blackbase") -> str:
-    func = "build_solver"
-    module = "build_solver"
-    verb = "fit" if kind == "trainer" else "run"
     return f'''"""CLI entry point for this {kind} case."""
 
-import argparse
-
-from blackbase.project import load_resource_context_from_env, print_resource_context_summary
-from blackbase.project.check_output import print_case_check
-from .{module} import {func}
+from blackbase.project import run_standard_case_cli
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Run this {kind} case.")
-    parser.add_argument("--check", action="store_true", help="Build only; do not run.")
-    args = parser.parse_args(argv)
-    resource_context = load_resource_context_from_env("{framework}")
-    case = {func}(resource_context=resource_context)
-    if args.check:
-        print_case_check(case)
-        return 0
-    print_resource_context_summary(resource_context)
-    action = getattr(case, "{verb}", None) or getattr(case, "run", None) or getattr(case, "step", None)
-    result = action() if callable(action) else case
-    print(result)
-    return 0
+    return run_standard_case_cli(__file__, framework="{framework}", argv=argv)
 
 
 if __name__ == "__main__":
@@ -812,9 +689,6 @@ class CaseConfig:
 def get_case_config() -> CaseConfig:
     return CaseConfig()
 '''
-
-
-init_project = create_project
 
 
 if __name__ == "__main__":

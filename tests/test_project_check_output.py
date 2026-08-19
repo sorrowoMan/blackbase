@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from blackbase.evaluation import EvaluationProviderSpec
+
 from blackbase.project import (
     build_case_check_payload,
     format_case_check,
@@ -49,13 +51,55 @@ def test_case_check_reports_attached_components_without_secrets() -> None:
     assert resource_summary == {"threads": 2}
 
 
+def test_case_check_discovers_formal_problem_provider_and_state_protocol() -> None:
+    provider = type(
+        "Provider",
+        (),
+        {
+            "spec": EvaluationProviderSpec(
+                provider_id="ml.torch/v1",
+                problem_ids=("ml.problem/v1",),
+                compute_backend="torch",
+                state_kinds=("model_parameters",),
+                materialization_targets=("unknown_state",),
+                transition_methods=("gradient.adam",),
+            )
+        },
+    )()
+    problem = type("Problem", (), {"name": "problem", "provider": provider})()
+    case = type(
+        "Case",
+        (),
+        {
+            "problem": problem,
+            "evaluation_provider": provider,
+        },
+    )()
+
+    payload = build_case_check_payload(case)
+
+    assert payload["providers"] == ["ml.torch/v1"]
+    assert payload["provider_details"] == [
+        {
+            "name": "Provider",
+            "provider_id": "ml.torch/v1",
+            "compute_backend": "torch",
+            "problem_ids": ["ml.problem/v1"],
+            "transition_methods": ["gradient.adam"],
+            "materialization_targets": ["unknown_state"],
+        }
+    ]
+
+
 def test_strict_doctor_requires_case_build_check_contract(tmp_path) -> None:
     project_root = create_project(tmp_path / "project")
     case_root = add_case("search", "solver", project_root=project_root)
     run_entry = case_root / "run_solver.py"
     run_entry.write_text(
-        run_entry.read_text(encoding="utf-8").replace("--check", "--inspect")
-        + "\n# Mentioning --check in a comment is not a CLI contract.\n",
+        "def main(argv=None):\n"
+        "    del argv\n"
+        "    return 0\n"
+        "\n# Mentioning --check in a comment is not a CLI contract.\n",
         encoding="utf-8",
     )
 

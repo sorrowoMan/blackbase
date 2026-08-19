@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 
 from .resources.model import DataRef
+from .state_ref import StateRef
 
 
 SHARED_TYPE_SCHEMA_VERSION = 1
@@ -33,6 +34,33 @@ SOLVE_STATUSES = frozenset(
     }
 )
 FEASIBILITY_STATUSES = frozenset({"unknown", "feasible", "infeasible"})
+
+_SOLVER_STATUS_RULES: Mapping[str, Mapping[str, Any]] = {
+    "optimal": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+        "forbids_approximate": True,
+        "forbids_positive_gap": True,
+        "forbids_infeasible_best": True,
+    },
+    "feasible": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+        "forbids_infeasible_best": True,
+    },
+    "infeasible": {
+        "forbidden_feasibility": frozenset({"feasible"}),
+        "forbids_feasible_best": True,
+    },
+    "unbounded": {
+        "forbidden_feasibility": frozenset({"infeasible"}),
+    },
+    "no_solution": {
+        "forbidden_feasibility": frozenset({"feasible"}),
+        "forbids_feasible_best": True,
+    },
+    "stopped": {},
+    "failed": {},
+    "unknown": {},
+}
 
 
 def _protocol_header(type_name: str) -> dict[str, Any]:
@@ -77,17 +105,19 @@ def _encode_shared_value(value: Any, *, path: str) -> Any:
         return str(value)
     if isinstance(value, DataRef):
         return _encode_data_ref(value)
+    if isinstance(value, StateRef):
+        return value.as_dict()
     if isinstance(
         value,
         (Feedback, PopulationSnapshot, TrainerResult, SolveQuality, SolverResult),
     ):
         return value.as_dict()
-    if isinstance(value, UnknownState):
+    if isinstance(value, (UnknownState, CandidateBatch)):
         return _encode_shared_value(value.as_dict(), path=path)
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _encode_shared_value(value.tolist(), path=path)
     if isinstance(value, np.generic):
-        return value.item()
+        return _encode_shared_value(value.item(), path=path)
     if isinstance(value, Mapping):
         return {
             str(key): _encode_shared_value(item, path=f"{path}.{key}")
@@ -117,8 +147,52 @@ def _decode_shared_value(value: Any) -> Any:
     if protocol_type == "blackbase.data_ref":
         _validate_protocol_header(payload, "data_ref")
         return DataRef.from_dict(payload)
+    if protocol_type == "blackbase.state_ref":
+        return StateRef.from_dict(payload)
+    if protocol_type == "blackbase.evaluation_provider_spec":
+        from .evaluation.model import EvaluationProviderSpec
+
+        return EvaluationProviderSpec.from_dict(payload)
+    if protocol_type == "blackbase.evaluation_request":
+        from .evaluation.model import EvaluationRequest
+
+        return EvaluationRequest.from_dict(payload)
+    if protocol_type == "blackbase.evaluation_binding":
+        from .evaluation.model import EvaluationBinding
+
+        return EvaluationBinding.from_dict(payload)
+    if protocol_type == "blackbase.evaluation_result":
+        from .evaluation.model import EvaluationResult
+
+        return EvaluationResult.from_dict(payload)
+    if protocol_type == "blackbase.state_transition_request":
+        from .evaluation.state_transition import StateTransitionRequest
+
+        return StateTransitionRequest.from_dict(payload)
+    if protocol_type == "blackbase.state_transition_result":
+        from .evaluation.state_transition import StateTransitionResult
+
+        return StateTransitionResult.from_dict(payload)
+    if protocol_type == "blackbase.state_materialization_request":
+        from .evaluation.state_transition import StateMaterializationRequest
+
+        return StateMaterializationRequest.from_dict(payload)
+    if protocol_type == "blackbase.state_materialization_result":
+        from .evaluation.state_transition import StateMaterializationResult
+
+        return StateMaterializationResult.from_dict(payload)
+    if protocol_type == "blackbase.state_release_request":
+        from .evaluation.state_transition import StateReleaseRequest
+
+        return StateReleaseRequest.from_dict(payload)
+    if protocol_type == "blackbase.state_release_result":
+        from .evaluation.state_transition import StateReleaseResult
+
+        return StateReleaseResult.from_dict(payload)
     if protocol_type == "blackbase.feedback":
         return Feedback.from_dict(payload)
+    if protocol_type == "blackbase.candidate_batch":
+        return CandidateBatch.from_dict(payload)
     if protocol_type == "blackbase.population_snapshot":
         return PopulationSnapshot.from_dict(payload)
     if protocol_type == "blackbase.trainer_result":
@@ -140,6 +214,18 @@ def _coerce_data_ref(value: Any) -> DataRef | None:
     raise TypeError(f"expected DataRef-compatible value, got {type(value).__name__}")
 
 
+def encode_shared_value(value: Any, *, path: str = "value") -> Any:
+    """Encode a value using the public BlackBase wire-safe value codec."""
+
+    return _encode_shared_value(value, path=str(path or "value"))
+
+
+def decode_shared_value(value: Any) -> Any:
+    """Decode a value produced by :func:`encode_shared_value`."""
+
+    return _decode_shared_value(value)
+
+
 @dataclass(frozen=True)
 class Feedback:
     """Evaluation feedback for a candidate/model state."""
@@ -152,12 +238,18 @@ class Feedback:
     residuals: Optional[np.ndarray] = None
     signals: dict[str, Any] = field(default_factory=dict)
     info: dict[str, Any] = field(default_factory=dict)
+    gradient_ref: StateRef | DataRef | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "objectives", np.asarray(self.objectives, dtype=float))
         object.__setattr__(self, "constraints", np.asarray(self.constraints, dtype=float))
         if self.gradients is not None:
             object.__setattr__(self, "gradients", np.asarray(self.gradients, dtype=float))
+        if self.gradient_ref is not None and not isinstance(
+            self.gradient_ref,
+            (StateRef, DataRef),
+        ):
+            raise TypeError("Feedback.gradient_ref must be a StateRef, DataRef, or None")
         if self.residuals is not None:
             object.__setattr__(self, "residuals", np.asarray(self.residuals, dtype=float))
         object.__setattr__(self, "metrics", dict(self.metrics or {}))
@@ -180,6 +272,10 @@ class Feedback:
             "objectives": self.objectives.tolist(),
             "constraints": self.constraints.tolist(),
             "gradients": None if self.gradients is None else self.gradients.tolist(),
+            "gradient_ref": _encode_shared_value(
+                self.gradient_ref,
+                path="feedback.gradient_ref",
+            ),
             "loss": _encode_shared_value(self.loss, path="feedback.loss"),
             "metrics": _encode_shared_value(self.metrics, path="feedback.metrics"),
             "residuals": None if self.residuals is None else self.residuals.tolist(),
@@ -199,6 +295,7 @@ class Feedback:
                 if data.get("gradients") is None
                 else np.asarray(data.get("gradients"), dtype=float)
             ),
+            gradient_ref=_decode_shared_value(data.get("gradient_ref")),
             loss=None if data.get("loss") is None else float(data.get("loss")),
             metrics=dict(_decode_shared_value(data.get("metrics", {})) or {}),
             residuals=(
@@ -211,34 +308,16 @@ class Feedback:
         )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class UnknownState:
-    """
-    Numeric candidate state.
-
-    Compatibility note: old mlblack code used both `meta=` and `metadata=`.
-    BlackBase accepts both and exposes `.metadata` as an alias for `.meta`.
-    """
+    """Numeric candidate state with one canonical metadata field."""
 
     values: np.ndarray
-    meta: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __init__(
-        self,
-        values: Any,
-        meta: Optional[Mapping[str, Any]] = None,
-        *,
-        metadata: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        merged = dict(meta or {})
-        if metadata:
-            merged.update(dict(metadata))
-        object.__setattr__(self, "values", np.asarray(values, dtype=float))
-        object.__setattr__(self, "meta", merged)
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        return dict(self.meta)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", np.asarray(self.values, dtype=float))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -252,21 +331,21 @@ class UnknownState:
         return np.asarray(self.values, dtype=float)
 
     def with_values(self, values: Any, **metadata: Any) -> "UnknownState":
-        meta = dict(self.meta)
-        meta.update(metadata)
-        return UnknownState(values=np.asarray(values, dtype=float), meta=meta)
+        current_metadata = dict(self.metadata)
+        current_metadata.update(metadata)
+        return UnknownState(values=np.asarray(values, dtype=float), metadata=current_metadata)
 
     def with_meta(self, **metadata: Any) -> "UnknownState":
-        meta = dict(self.meta)
-        meta.update(metadata)
-        return UnknownState(values=self.values.copy(), meta=meta)
+        current_metadata = dict(self.metadata)
+        current_metadata.update(metadata)
+        return UnknownState(values=self.values.copy(), metadata=current_metadata)
 
     def to_protocol_payload(self) -> dict[str, Any]:
         """Return the stable, JSON-safe-codec input used by shared stores."""
         return {
             "version": 1,
             "values": self.as_array(),
-            "metadata": dict(self.meta),
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -280,7 +359,136 @@ class UnknownState:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {"values": self.as_array().tolist(), "metadata": dict(self.meta)}
+        return {"values": self.as_array().tolist(), "metadata": dict(self.metadata)}
+
+
+@dataclass(frozen=True)
+class CandidateBatch:
+    """Aligned semantic and numeric views of one candidate batch.
+
+    Numeric algorithms consume :attr:`numeric_matrix`; representation,
+    evaluation and lineage code consume :attr:`semantic_states`.  The two
+    views are validated together so converting an ``UnknownState`` to a row
+    never discards its decode-relevant metadata.
+    """
+
+    semantic_states: Sequence[UnknownState]
+    numeric_matrix: np.ndarray
+    candidate_tokens: Sequence[str | None] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        states = tuple(
+            state
+            if isinstance(state, UnknownState)
+            else UnknownState.from_protocol_payload(state)
+            if isinstance(state, Mapping)
+            else UnknownState(values=state)
+            for state in tuple(self.semantic_states)
+        )
+        matrix = np.asarray(self.numeric_matrix, dtype=float)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1) if matrix.size else matrix.reshape(0, 0)
+        if matrix.ndim != 2:
+            raise ValueError("CandidateBatch.numeric_matrix must be two-dimensional")
+        if int(matrix.shape[0]) != len(states):
+            raise ValueError(
+                "CandidateBatch semantic/numeric row counts must match: "
+                f"{len(states)} != {int(matrix.shape[0])}"
+            )
+        detached_states: list[UnknownState] = []
+        for index, state in enumerate(states):
+            values = np.asarray(state.as_array(), dtype=float).reshape(-1)
+            if int(values.size) != int(matrix.shape[1]):
+                raise ValueError(
+                    f"CandidateBatch.semantic_states[{index}] has dimension "
+                    f"{int(values.size)}; expected {int(matrix.shape[1])}"
+                )
+            if not np.array_equal(values, matrix[index], equal_nan=True):
+                raise ValueError(
+                    f"CandidateBatch.semantic_states[{index}] does not match its numeric row"
+                )
+            detached_states.append(
+                UnknownState(
+                    values=values.copy(),
+                    metadata=dict(
+                        _decode_shared_value(
+                            _encode_shared_value(
+                                dict(state.metadata),
+                                path=f"candidate_batch.semantic_states[{index}].metadata",
+                            )
+                        )
+                        or {}
+                    ),
+                )
+            )
+        tokens = tuple(self.candidate_tokens)
+        if not tokens:
+            tokens = (None,) * len(states)
+        if len(tokens) != len(states):
+            raise ValueError("CandidateBatch.candidate_tokens must align with candidate rows")
+        normalized_tokens = tuple(
+            None if token is None else str(token).strip() or None for token in tokens
+        )
+        matrix_copy = matrix.copy()
+        matrix_copy.setflags(write=False)
+        object.__setattr__(self, "semantic_states", tuple(detached_states))
+        object.__setattr__(self, "numeric_matrix", matrix_copy)
+        object.__setattr__(self, "candidate_tokens", normalized_tokens)
+
+    @classmethod
+    def from_candidates(
+        cls,
+        candidates: Sequence[Any],
+        *,
+        candidate_tokens: Sequence[str | None] = (),
+    ) -> "CandidateBatch":
+        states = tuple(
+            item
+            if isinstance(item, UnknownState)
+            else UnknownState(values=np.asarray(item, dtype=float).reshape(-1))
+            for item in tuple(candidates)
+        )
+        if states:
+            matrix = np.stack(
+                [np.asarray(state.as_array(), dtype=float).reshape(-1) for state in states],
+                axis=0,
+            )
+        else:
+            matrix = np.empty((0, 0), dtype=float)
+        return cls(
+            semantic_states=states,
+            numeric_matrix=matrix,
+            candidate_tokens=tuple(candidate_tokens),
+        )
+
+    def numeric_rows(self) -> tuple[np.ndarray, ...]:
+        """Return detached writable rows for ndarray-native algorithms."""
+
+        return tuple(np.asarray(row, dtype=float).copy() for row in self.numeric_matrix)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            **_protocol_header("candidate_batch"),
+            "semantic_states": [state.as_dict() for state in self.semantic_states],
+            "numeric_matrix": self.numeric_matrix.tolist(),
+            "candidate_tokens": list(self.candidate_tokens),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CandidateBatch":
+        _validate_protocol_header(payload, "candidate_batch")
+        states = tuple(
+            UnknownState(
+                values=np.asarray(dict(item).get("values", ()), dtype=float),
+                metadata=dict(dict(item).get("metadata", {}) or {}),
+            )
+            for item in tuple(payload.get("semantic_states", ()) or ())
+        )
+        return cls(
+            semantic_states=states,
+            numeric_matrix=np.asarray(payload.get("numeric_matrix", ()), dtype=float),
+            candidate_tokens=tuple(payload.get("candidate_tokens", ()) or ()),
+        )
 
 
 @dataclass(frozen=True)
@@ -565,10 +773,15 @@ class SolverResult:
                 np.asarray(self.best_objectives, dtype=float).reshape(-1),
             )
         if self.best_constraint_violation is not None:
+            best_constraint_violation = float(self.best_constraint_violation)
+            if not np.isfinite(best_constraint_violation):
+                raise ValueError(
+                    "SolverResult.best_constraint_violation must be finite"
+                )
             object.__setattr__(
                 self,
                 "best_constraint_violation",
-                float(self.best_constraint_violation),
+                best_constraint_violation,
             )
         solve_status = str(self.solve_status or "unknown").strip().lower()
         if solve_status not in SOLVE_STATUSES:
@@ -711,16 +924,33 @@ def _validate_solver_result_consistency(
     quality: SolveQuality,
     best_constraint_violation: float | None,
 ) -> None:
-    contradictory_statuses = {
-        ("optimal", "infeasible"),
-        ("feasible", "infeasible"),
-        ("infeasible", "feasible"),
-        ("no_solution", "feasible"),
-    }
-    if (solve_status, feasibility) in contradictory_statuses:
+    rules = _SOLVER_STATUS_RULES[solve_status]
+    forbidden_feasibility = rules.get("forbidden_feasibility", frozenset())
+    if feasibility in forbidden_feasibility:
         raise ValueError(
             "inconsistent SolverResult terminal semantics: "
             f"solve_status='{solve_status}', feasibility='{feasibility}'"
+        )
+    best_is_feasible = (
+        None
+        if best_constraint_violation is None
+        else float(best_constraint_violation) <= 0.0
+    )
+    if feasibility == "feasible" and best_is_feasible is False:
+        raise ValueError(
+            "a feasible SolverResult conflicts with a positive best constraint violation"
+        )
+    if feasibility == "infeasible" and best_is_feasible is True:
+        raise ValueError(
+            "an infeasible SolverResult conflicts with a feasible declared best"
+        )
+    if rules.get("forbids_infeasible_best") and best_is_feasible is False:
+        raise ValueError(
+            f"solve_status='{solve_status}' conflicts with a positive best constraint violation"
+        )
+    if rules.get("forbids_feasible_best") and best_is_feasible is True:
+        raise ValueError(
+            f"solve_status='{solve_status}' conflicts with a feasible declared best"
         )
     positive_gap = any(
         value is not None and float(value) > 0.0
@@ -730,24 +960,24 @@ def _validate_solver_result_consistency(
         raise ValueError(
             "SolveQuality.approximate=False conflicts with a positive optimality gap"
         )
-    if solve_status == "optimal" and positive_gap:
-        raise ValueError("solve_status='optimal' conflicts with a positive optimality gap")
-    if (
-        solve_status == "optimal"
-        and best_constraint_violation is not None
-        and float(best_constraint_violation) > 0.0
-    ):
+    if rules.get("forbids_approximate") and quality.approximate is True:
         raise ValueError(
-            "solve_status='optimal' conflicts with a positive best constraint violation"
+            "solve_status='optimal' conflicts with SolveQuality.approximate=True"
         )
+    if rules.get("forbids_positive_gap") and positive_gap:
+        raise ValueError("solve_status='optimal' conflicts with a positive optimality gap")
 
 
 __all__ = [
     "SHARED_TYPE_SCHEMA_VERSION",
     "SOLVE_STATUSES",
     "FEASIBILITY_STATUSES",
+    "encode_shared_value",
+    "decode_shared_value",
     "Feedback",
+    "StateRef",
     "UnknownState",
+    "CandidateBatch",
     "PopulationSnapshot",
     "TrainerResult",
     "SolveQuality",

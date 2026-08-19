@@ -7,7 +7,7 @@ Design:
   lifecycle dispatch, and short-circuit evaluation. It is shared infrastructure
   because both nsgablack and mlblack use the same dispatch semantics.
 - Framework-specific helpers (e.g. ``get_population_snapshot``) live in
-  ``blackbase.adapters.<framework>.plugin`` or in the framework itself.
+  the downstream semantic framework itself.
 """
 
 from __future__ import annotations

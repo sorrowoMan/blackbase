@@ -32,10 +32,13 @@ Project 运行时和 Doctor 始终加载、校验规范入口；`kind=trainer` �
 ### Context / Snapshot
 
 - `ContextStore` / `create_context_store`
+- built-in ContextStore backends expose atomic `apply_patch(set/delete)` updates
 - `SnapshotStore` / `create_snapshot_store`
 - `ContextContract`
 - canonical context key registry
 - context schema / replay helpers
+- canonical `best_candidate_ref` for keeping oversized incumbent candidates in SnapshotStore
+- canonical Adapter-local best projection keys: `adapter_best_x`, `adapter_best_objectives`, `adapter_best_score`
 
 ### L0 Resources
 
@@ -54,6 +57,19 @@ Project 运行时和 Doctor 始终加载、校验规范入口；`kind=trainer` �
 - `PipelineSlotSpec`
 - `PipelineOrchestrator`
 - `build_pipeline_kernel`
+
+### Problem Evaluation Layer
+
+- `EvaluationRequest` / `EvaluationResult`：Problem 与 Provider 之间的版本化批评估信封。
+- `EvaluationProviderSpec`：声明可服务的 `problem_ids`、语义 capability、硬资源下限、compute backend、设备偏好与 state transition methods；Registry 不会把同 capability 的 Provider 错绑到另一种 Problem。
+- `EvaluationProviderRegistry` / `EvaluationGateway`：只在 Project L0 已授权的 `ResourceContext` 内绑定和执行 Provider，不自行分配资源。
+- `EvaluationBinding`：记录实际 Provider、设备、fallback、能力匹配和 grant namespace。
+- `StateRef`：Provider 持有的活状态引用，与持久化 `DataRef` 严格分离。
+- `StateTransitionMethodSpec`：声明每个设备 kernel 的 required/optional operands、parameters、input slots 与 result slots。
+- `StateTransitionRequest` / `StateTransitionResult`：由 Adapter 选择方法和参数、Provider 执行设备 kernel 的版本栅栏更新协议。
+- `StateMaterializationRequest` / `StateMaterializationResult`：把进程内活 `StateRef` 显式导出为数值 `UnknownState` 或持久化 `DataRef`；可在成功导出后释放活状态，不能伪造可恢复引用。
+
+通用 Adapter 不声明 Torch/JAX/CUDA；它只消费 `Feedback` 并决定求解方法。具体 Problem/Evaluation Provider 声明 `autograd.backward`、设备偏好和可执行的 `gradient.sgd/adam/adamw` kernel，L0 仍是线程、GPU、内存与 lease 的唯一授权者。活参数、梯度和 optimizer slot 可保持在 Provider 设备侧；checkpoint 只保存已物化的数值影子和审计，不会把旧进程的 `StateRef` 冒充为已恢复设备状态。
 
 ### 递归 Case 调用协议
 
@@ -101,21 +117,41 @@ deadline/cancellation。预算通过可序列化 handle 委派，子 Case 未使
 
 - `UnknownState`
 - `Feedback`
+- `StateRef`
 - `PopulationSnapshot`
 - `TrainerResult`
 - `SolverResult`
+
+`Feedback` 可内联小型 `gradients`，也可通过 `gradient_ref` 指向 Provider 持有的设备梯度；后者与 `StateTransitionRequest` 组合，允许 nsgablack 的通用梯度 Adapter 控制算法，同时由 mlblack Provider 保持参数、梯度和 optimizer slots 的设备本地状态。
 
 `SolverResult` separates Case execution success from optimization semantics.
 Its typed terminal fields are `solve_status`, `termination_reason`,
 `feasibility`, and `SolveQuality` (approximation, gaps, bound, and metrics).
 `SolveQuality.approximate` is tri-state: `None` means no quality evidence,
 while `True`/`False` are explicit claims. Contradictory terminal states and
-quality claims are rejected by the codec.
+quality claims are rejected by one centralized status-rule matrix. Feasibility
+evidence is checked in both directions: feasible semantics cannot attach a
+positive best violation, while `infeasible`/`no_solution` cannot attach a
+feasible authoritative best; `unbounded + infeasible` is also rejected.
 Best fields are optional and must be declared by the Solver; a Pareto front can
 be delivered inline or through a real `DataRef` published by the Project
 artifact authority.
 
 这些类型用于跨 `nsgablack` / `mlblack` Case surface 传递轻量候选状态和反馈，不承载任一语义层的私有逻辑。
+
+## 共享协议版本
+
+当前三仓共享底座基线为 `blackbase 0.3.3`。`nsgablack` 与 `mlblack`
+必须声明 `blackbase>=0.3.3,<0.4.0`；该下限包含 CandidateBatch 双视图、StateRelease、trajectory lineage 和正式 Evaluation Provider、
+StateRef transition 与 materialization 协议。
+
+0.3 完成了共享底座的干净边界：删除两侧资源、Context 与 Adapter 转发树；
+公共调用绑定、Pipeline 编排、Catalog、Case stage、任务运行后端均由 BlackBase
+直接提供。Adapter 的唯一运行投影入口是
+`get_runtime_context_projection(control)`，组合投影的健康、因果摘要和叶子 writer
+来源均进入有界正式信封。具体破坏性变更见 [MIGRATION.md](MIGRATION.md)。
+
+包版本、共享类型 wire schema 与 Context schema 分别演进，不能互相代替。
 
 ## 安装
 

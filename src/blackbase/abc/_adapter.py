@@ -29,7 +29,7 @@ class AdapterBase(ABC):
     - setup / teardown — lifecycle
     - get_state / set_state — checkpoint
     - coerce_candidates — normalize propose() output
-    - get_context_projection — runtime context exposure
+    - get_runtime_context_projection — runtime context exposure
     - set_population — population write-back
     - validate_population_snapshot — snapshot validation
     - create_local_rng — component-local RNG
@@ -135,8 +135,18 @@ class AdapterBase(ABC):
 
     # --- Context projection ---
 
-    def get_context_projection(self, control: Any) -> Mapping[str, Any]:
-        """Return runtime fields to expose in control plane context."""
+    def get_runtime_context_projection(self, control: Any) -> Mapping[str, Any]:
+        """Return runtime fields to expose in control plane context.
+        """
+        del control
+        return {}
+
+    def get_runtime_context_projection_sources(
+        self,
+        control: Any,
+    ) -> Mapping[str, str]:
+        """Return writer attribution for projected runtime fields."""
+        del control
         return {}
 
     # --- Population write-back ---

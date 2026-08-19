@@ -18,11 +18,12 @@ from .context_keys import (
     unknown_context_keys,
 )
 
-# Attribute name aliases for backward compatibility
-_REQUIRES_ATTRS = ("context_requires", "requires_context_keys", "runtime_requires", "requires")
-_PROVIDES_ATTRS = ("context_provides", "provides_context_keys", "runtime_provides", "provides")
-_MUTATES_ATTRS = ("context_mutates", "mutates_context_keys", "runtime_mutates", "mutates")
-_CACHE_ATTRS = ("context_cache", "cache_context_keys", "runtime_cache", "cache")
+# Component attributes use the explicit ``context_*`` names; normalized
+# contract objects expose their compact ``requires/provides/...`` fields.
+_REQUIRES_ATTRS = ("context_requires", "requires")
+_PROVIDES_ATTRS = ("context_provides", "provides")
+_MUTATES_ATTRS = ("context_mutates", "mutates")
+_CACHE_ATTRS = ("context_cache", "cache")
 _ARTIFACT_REQUIRES_ATTRS = ("artifact_requires",)
 _ARTIFACT_PROVIDES_ATTRS = ("artifact_provides",)
 _PHASE_IN_ATTRS = ("phase_in",)
@@ -126,8 +127,8 @@ class ContextContract:
     """
     Unified context contract declaration for components.
     
-    Supports both NSGABlack-style (requires/provides/mutates/cache) and
-    MLBlack-style (context_requires/context_provides/etc.) attribute names.
+    Contract values use ``requires/provides/mutates/cache``. Component class
+    attributes are normalized by :meth:`from_component`.
     """
     
     name: str = ""
@@ -166,36 +167,19 @@ class ContextContract:
         requires_metrics: Sequence[str] = (),
         metrics_fallback: str = "strict",
         metadata: Mapping[str, Any] | None = None,
-        # MLBlack-style aliases
-        context_requires: Sequence[str] = (),
-        context_optional: Sequence[str] = (),
-        context_provides: Sequence[str] = (),
-        context_mutates: Sequence[str] = (),
-        context_cache: Sequence[str] = (),
-        requires_context_keys: Sequence[str] = (),
-        provides_context_keys: Sequence[str] = (),
-        mutates_context_keys: Sequence[str] = (),
-        cache_context_keys: Sequence[str] = (),
-        context_notes: Optional[str] = None,
     ):
-        """
-        Initialize a context contract.
-        
-        Supports both NSGABlack-style and MLBlack-style parameter names.
-        When both styles are provided, they are merged.
-        """
-        # Merge both naming styles
+        """Initialize a normalized shared context contract."""
         object.__setattr__(self, "name", str(name or ""))
-        object.__setattr__(self, "requires", tuple(requires) + tuple(context_requires) + tuple(requires_context_keys))
-        object.__setattr__(self, "optional", tuple(optional) + tuple(context_optional))
-        object.__setattr__(self, "provides", tuple(provides) + tuple(context_provides) + tuple(provides_context_keys))
-        object.__setattr__(self, "mutates", tuple(mutates) + tuple(context_mutates) + tuple(mutates_context_keys))
-        object.__setattr__(self, "cache", tuple(cache) + tuple(context_cache) + tuple(cache_context_keys))
+        object.__setattr__(self, "requires", tuple(requires))
+        object.__setattr__(self, "optional", tuple(optional))
+        object.__setattr__(self, "provides", tuple(provides))
+        object.__setattr__(self, "mutates", tuple(mutates))
+        object.__setattr__(self, "cache", tuple(cache))
         object.__setattr__(self, "artifact_requires", tuple(artifact_requires))
         object.__setattr__(self, "artifact_provides", tuple(artifact_provides))
         object.__setattr__(self, "phase_in", tuple(phase_in))
         object.__setattr__(self, "phase_out", tuple(phase_out))
-        object.__setattr__(self, "notes", _merge_notes(notes, context_notes))
+        object.__setattr__(self, "notes", notes)
         object.__setattr__(self, "requires_metrics", tuple(str(item) for item in requires_metrics))
         object.__setattr__(self, "metrics_fallback", str(metrics_fallback or "strict"))
         object.__setattr__(self, "metadata", dict(metadata or {}))
@@ -240,7 +224,7 @@ class ContextContract:
         }
 
     def as_dict(self) -> Dict[str, Any]:
-        """Return the legacy mlblack-shaped dictionary representation."""
+        """Return the component-attribute-shaped dictionary representation."""
 
         norm = self.normalized()
         return {
@@ -393,18 +377,17 @@ class ContextContract:
 
 def _read_keys(component: Any, source: Any, attr: str, fallback: Iterable[str]) -> tuple[str, ...]:
     """Read context keys from component with fallback support."""
-    # Try both naming conventions
-    unified_attr = attr
-    legacy_attr = f"context_{attr}"
+    contract_attr = attr
+    component_attr = f"context_{attr}"
     
-    if hasattr(component, unified_attr):
-        return normalize_context_keys(getattr(component, unified_attr))
-    if hasattr(source, unified_attr):
-        return normalize_context_keys(getattr(source, unified_attr))
-    if hasattr(component, legacy_attr):
-        return normalize_context_keys(getattr(component, legacy_attr))
-    if hasattr(source, legacy_attr):
-        return normalize_context_keys(getattr(source, legacy_attr))
+    if hasattr(component, component_attr):
+        return normalize_context_keys(getattr(component, component_attr))
+    if hasattr(source, component_attr):
+        return normalize_context_keys(getattr(source, component_attr))
+    if hasattr(component, contract_attr):
+        return normalize_context_keys(getattr(component, contract_attr))
+    if hasattr(source, contract_attr):
+        return normalize_context_keys(getattr(source, contract_attr))
     return normalize_context_keys(fallback)
 
 
@@ -433,26 +416,19 @@ def get_component_contract(obj: Any) -> Optional[ContextContract]:
             )
             return ContextContract(
                 requires=list(value.get("requires", ()) or ())
-                + list(value.get("context_requires", ()) or ())
-                + list(value.get("requires_context_keys", ()) or ())
-                + list(value.get("runtime_requires", ()) or ()),
+                + list(value.get("context_requires", ()) or ()),
                 provides=list(value.get("provides", ()) or ())
-                + list(value.get("context_provides", ()) or ())
-                + list(value.get("provides_context_keys", ()) or ())
-                + list(value.get("runtime_provides", ()) or ()),
+                + list(value.get("context_provides", ()) or ()),
                 mutates=list(value.get("mutates", ()) or ())
-                + list(value.get("context_mutates", ()) or ())
-                + list(value.get("mutates_context_keys", ()) or ())
-                + list(value.get("runtime_mutates", ()) or ()),
+                + list(value.get("context_mutates", ()) or ()),
                 cache=list(value.get("cache", ()) or ())
-                + list(value.get("context_cache", ()) or ())
-                + list(value.get("cache_context_keys", ()) or ())
-                + list(value.get("runtime_cache", ()) or ()),
+                + list(value.get("context_cache", ()) or ()),
                 artifact_requires=list(value.get("artifact_requires", ()) or ()),
                 artifact_provides=list(value.get("artifact_provides", ()) or ()),
                 phase_in=list(value.get("phase_in", ()) or ()),
                 phase_out=list(value.get("phase_out", ()) or ()),
                 notes=notes,
+                metadata=dict(value.get("metadata", {}) or {}),
             ).normalized()
     
     # Collect from class/instance attributes
@@ -497,7 +473,12 @@ def collect_solver_contracts(solver: Any) -> List[Tuple[str, ContextContract]]:
     contracts: List[Tuple[str, ContextContract]] = []
     seen: set[Tuple[str, int]] = set()
     
-    def _add(name: str, obj: Any) -> None:
+    def _add(
+        name: str,
+        obj: Any,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         if obj is None:
             return
         marker = (str(name), id(obj))
@@ -506,26 +487,46 @@ def collect_solver_contracts(solver: Any) -> List[Tuple[str, ContextContract]]:
         seen.add(marker)
         contract = get_component_contract(obj)
         if contract is not None:
+            if metadata:
+                payload = contract.to_dict()
+                payload["metadata"] = {
+                    **dict(contract.metadata),
+                    **dict(metadata),
+                }
+                contract = ContextContract(**payload).normalized()
             contracts.append((name, contract))
-    
+
+    _add("solver", solver)
     _add("representation_pipeline", getattr(solver, "representation_pipeline", None))
     _add("bias_module", getattr(solver, "bias_module", None))
     
     adapter = getattr(solver, "adapter", None)
-    _add("adapter", adapter)
+    encapsulates_children = bool(
+        getattr(adapter, "context_contract_encapsulates_children", False)
+    ) if adapter is not None else False
+    writer_scope = {"writer_scope": "adapter"} if encapsulates_children else None
+    _add("adapter", adapter, metadata=writer_scope)
     if adapter is not None:
         for idx, spec in enumerate(getattr(adapter, "strategies", ()) or ()):
             sub = getattr(spec, "adapter", None)
             name = str(getattr(spec, "name", f"strategy_{idx}"))
-            _add(f"adapter.strategy.{name}", sub)
+            _add(f"adapter.strategy.{name}", sub, metadata=writer_scope)
         for idx, role in enumerate(getattr(adapter, "roles", ()) or ()):
             role_name = str(getattr(role, "name", f"role_{idx}"))
             role_adapter = getattr(role, "adapter", None)
-            _add(f"adapter.role.{role_name}", role_adapter if not callable(role_adapter) else None)
+            _add(
+                f"adapter.role.{role_name}",
+                role_adapter if not callable(role_adapter) else None,
+                metadata=writer_scope,
+            )
         for unit in getattr(adapter, "units", ()) or ():
             role_name = str(getattr(unit, "role", "role"))
             unit_id = int(getattr(unit, "unit_id", 0))
-            _add(f"adapter.unit.{role_name}#{unit_id}", getattr(unit, "adapter", None))
+            _add(
+                f"adapter.unit.{role_name}#{unit_id}",
+                getattr(unit, "adapter", None),
+                metadata=writer_scope,
+            )
     
     plugin_manager = getattr(solver, "plugin_manager", None)
     if plugin_manager is not None:
@@ -555,19 +556,21 @@ def detect_context_conflicts(
     contracts: Sequence[Tuple[str, ContextContract]],
 ) -> List[str]:
     """Detect potential multi-writer risks on the same context key."""
-    writers_by_key: Dict[str, List[str]] = {}
+    writers_by_key: Dict[str, List[Tuple[str, str]]] = {}
     for name, contract in contracts:
+        scope = str(contract.metadata.get("writer_scope", "") or name)
         keys = set(contract.provides) | set(contract.mutates)
         for key in keys:
             k = str(key).strip()
             if not k:
                 continue
-            writers_by_key.setdefault(k, []).append(str(name))
+            writers_by_key.setdefault(k, []).append((str(name), scope))
     
     issues: List[str] = []
     for key, writers in sorted(writers_by_key.items(), key=lambda x: x[0]):
-        unique = sorted(set(writers))
-        if len(unique) <= 1:
+        unique_scopes = {scope for _name, scope in writers}
+        if len(unique_scopes) <= 1:
             continue
-        issues.append(f"{key}: " + ", ".join(unique))
+        unique_names = sorted({name for name, _scope in writers})
+        issues.append(f"{key}: " + ", ".join(unique_names))
     return issues

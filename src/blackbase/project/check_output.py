@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from .case_binding import case_resource_binding_audit
+
 
 _RESOURCE_KEYS = (
     "device",
@@ -43,7 +45,8 @@ def build_case_check_payload(
     )
     mediator = getattr(case, "evaluation_mediator", None)
     list_providers = getattr(mediator, "list_providers", None)
-    providers = tuple(list_providers()) if callable(list_providers) else ()
+    mediator_providers = tuple(list_providers()) if callable(list_providers) else ()
+    providers = _attached_providers(case, mediator_providers)
 
     effective_resource_context = resource_context
     if effective_resource_context is None:
@@ -59,9 +62,11 @@ def build_case_check_payload(
         "mutator": _pipeline_component_name(pipeline, pipeline_description, "mutator"),
         "repair": _pipeline_component_name(pipeline, pipeline_description, "repair"),
         "adapter": _component_name(getattr(case, "adapter", None)),
-        "providers": [_component_name(provider) for provider in providers],
+        "providers": [_provider_name(provider) for provider in providers],
+        "provider_details": [_provider_details(provider) for provider in providers],
         "plugins": [_component_name(plugin) for plugin in plugins],
         "resource_context": _safe_resource_context(effective_resource_context),
+        "resource_binding": case_resource_binding_audit(case),
     }
 
 
@@ -101,6 +106,56 @@ def _component_name(component: Any) -> str:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return type(component).__name__
+
+
+def _attached_providers(case: Any, mediator_providers: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Discover Providers from formal and compatibility attachment surfaces."""
+
+    values: list[Any] = list(mediator_providers)
+    direct = getattr(case, "evaluation_provider", None)
+    if direct is not None:
+        values.append(direct)
+    collection = getattr(case, "evaluation_providers", None)
+    if isinstance(collection, Mapping):
+        values.extend(collection.values())
+    elif isinstance(collection, (list, tuple, set, frozenset)):
+        values.extend(collection)
+    problem_provider = getattr(getattr(case, "problem", None), "provider", None)
+    if problem_provider is not None:
+        values.append(problem_provider)
+
+    unique: list[Any] = []
+    seen: set[int] = set()
+    for provider in values:
+        if provider is None or id(provider) in seen:
+            continue
+        seen.add(id(provider))
+        unique.append(provider)
+    return tuple(unique)
+
+
+def _provider_name(provider: Any) -> str:
+    spec = getattr(provider, "spec", None)
+    provider_id = getattr(spec, "provider_id", None)
+    if isinstance(provider_id, str) and provider_id.strip():
+        return provider_id.strip()
+    return _component_name(provider)
+
+
+def _provider_details(provider: Any) -> dict[str, Any]:
+    spec = getattr(provider, "spec", None)
+    transition_ids = getattr(spec, "transition_method_ids", ()) if spec is not None else ()
+    return {
+        "name": _component_name(provider),
+        "provider_id": _provider_name(provider),
+        "compute_backend": str(getattr(spec, "compute_backend", "") or ""),
+        "problem_ids": [str(item) for item in (getattr(spec, "problem_ids", ()) or ())],
+        "transition_methods": [str(item) for item in (transition_ids or ())],
+        "materialization_targets": [
+            str(item)
+            for item in (getattr(spec, "materialization_targets", ()) or ())
+        ],
+    }
 
 
 def _pipeline_component_name(

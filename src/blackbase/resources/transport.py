@@ -9,6 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Iterator, Mapping, Protocol, Sequence
 from uuid import uuid4
 
@@ -99,6 +100,262 @@ class TaskTransport(Protocol):
     def list_workers(self, *, max_age_seconds: float | None = None) -> tuple[WorkerDescriptor, ...]: ...
 
     def counts(self) -> dict[str, int]: ...
+
+
+class InMemoryTaskTransport:
+    """Process-local implementation of the canonical task transport.
+
+    It follows the same claim/fencing contract as the durable transports and
+    is intended for tests and single-process execution, not cross-process use.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[str, TaskRecord] = {}
+        self._workers: dict[str, WorkerDescriptor] = {}
+        self._lease_tokens: dict[str, str] = {}
+        self._lock = RLock()
+
+    def submit(self, task: TaskEnvelope | Mapping[str, Any]) -> TaskRecord:
+        envelope = task if isinstance(task, TaskEnvelope) else TaskEnvelope.from_dict(task)
+        with self._lock:
+            current = self._records.get(envelope.task_id)
+            if current is not None:
+                if current.task.as_dict() != envelope.as_dict():
+                    raise TaskTransportError(
+                        f"task_id='{envelope.task_id}' already exists with a different envelope"
+                    )
+                return current
+            record = TaskRecord(task=envelope, status="queued", updated_at=time.time())
+            self._records[envelope.task_id] = record
+            return record
+
+    def register_worker(
+        self,
+        worker: WorkerDescriptor | Mapping[str, Any],
+    ) -> WorkerDescriptor:
+        descriptor = worker if isinstance(worker, WorkerDescriptor) else WorkerDescriptor.from_dict(worker)
+        descriptor = descriptor.heartbeat(status="online")
+        with self._lock:
+            self._workers[descriptor.worker_id] = descriptor
+        return descriptor
+
+    def heartbeat_worker(self, worker_id: str, *, status: str = "online") -> bool:
+        with self._lock:
+            current = self._workers.get(str(worker_id))
+            if current is None:
+                return False
+            self._workers[current.worker_id] = current.heartbeat(status=status)
+            return True
+
+    def list_workers(self, *, max_age_seconds: float | None = None) -> tuple[WorkerDescriptor, ...]:
+        now = time.time()
+        with self._lock:
+            workers = tuple(self._workers.values())
+        if max_age_seconds is None:
+            return workers
+        return tuple(
+            item
+            for item in workers
+            if now - float(item.last_heartbeat_at) <= float(max_age_seconds)
+        )
+
+    def claim(
+        self,
+        worker: WorkerDescriptor | Mapping[str, Any],
+        *,
+        lease_seconds: float = 30.0,
+        task_types: Sequence[str] = (),
+        namespaces: Sequence[str] = (),
+    ) -> ClaimedTask | None:
+        descriptor = self.register_worker(worker)
+        accepted_types = {str(item) for item in task_types if str(item)}
+        accepted_namespaces = {str(item) for item in namespaces if str(item)}
+        now = time.time()
+        with self._lock:
+            self._recover_expired_locked(now)
+            active = sum(
+                1
+                for item in self._records.values()
+                if item.status == "leased" and item.worker_id == descriptor.worker_id
+            )
+            if active >= descriptor.max_inflight:
+                return None
+            for task_id, record in self._records.items():
+                task = record.task
+                if record.status != "queued":
+                    continue
+                if accepted_types and task.task_type not in accepted_types:
+                    continue
+                if accepted_namespaces and task.namespace not in accepted_namespaces:
+                    continue
+                if not descriptor.can_run(
+                    task.requirement,
+                    executor_backend=task.executor_backend,
+                    active_count=active,
+                ):
+                    continue
+                claim = ClaimedTask(
+                    task=task,
+                    worker_id=descriptor.worker_id,
+                    lease_token=uuid4().hex,
+                    attempt=int(record.attempt) + 1,
+                    lease_expires_at=now + max(0.1, float(lease_seconds)),
+                )
+                self._records[task_id] = TaskRecord(
+                    task=task,
+                    status="leased",
+                    attempt=claim.attempt,
+                    worker_id=claim.worker_id,
+                    lease_expires_at=claim.lease_expires_at,
+                    updated_at=now,
+                )
+                self._lease_tokens[task_id] = claim.lease_token
+                return claim
+        return None
+
+    def heartbeat_task(self, claim: ClaimedTask, *, lease_seconds: float = 30.0) -> bool:
+        now = time.time()
+        with self._lock:
+            record = self._records.get(claim.task.task_id)
+            if not self._claim_is_current(record, claim, now=now):
+                return False
+            self._records[claim.task.task_id] = TaskRecord(
+                task=record.task,
+                status="leased",
+                attempt=record.attempt,
+                worker_id=record.worker_id,
+                lease_expires_at=now + max(0.1, float(lease_seconds)),
+                updated_at=now,
+            )
+            return True
+
+    def complete(
+        self,
+        claim: ClaimedTask,
+        result: TaskResult | Mapping[str, Any],
+    ) -> TaskRecord:
+        task_result = result if isinstance(result, TaskResult) else TaskResult.from_dict(result)
+        if not task_result.ok:
+            raise TaskTransportError("complete() requires a successful TaskResult; use fail()")
+        return self._finish(claim, task_result, status="succeeded", allow_retry=False)
+
+    def fail(
+        self,
+        claim: ClaimedTask,
+        result: TaskResult | Mapping[str, Any],
+    ) -> TaskRecord:
+        task_result = result if isinstance(result, TaskResult) else TaskResult.from_dict(result)
+        if task_result.ok:
+            raise TaskTransportError("fail() requires a failed TaskResult; use complete()")
+        return self._finish(claim, task_result, status="failed", allow_retry=True)
+
+    def _finish(
+        self,
+        claim: ClaimedTask,
+        result: TaskResult,
+        *,
+        status: str,
+        allow_retry: bool,
+    ) -> TaskRecord:
+        if result.task_id != claim.task.task_id:
+            raise TaskLeaseError("TaskResult.task_id does not match the claimed task")
+        now = time.time()
+        with self._lock:
+            current = self._records.get(claim.task.task_id)
+            if not self._claim_is_current(current, claim, now=now):
+                raise TaskLeaseError(f"task lease is not current for task_id='{claim.task.task_id}'")
+            retry = bool(allow_retry and claim.attempt <= claim.task.max_retries)
+            record = TaskRecord(
+                task=claim.task,
+                status="queued" if retry else status,
+                attempt=claim.attempt,
+                result=None if retry else result,
+                error=str(result.error or ""),
+                updated_at=now,
+            )
+            self._records[claim.task.task_id] = record
+            self._lease_tokens.pop(claim.task.task_id, None)
+            return record
+
+    def get(self, task_id: str) -> TaskRecord | None:
+        with self._lock:
+            return self._records.get(str(task_id))
+
+    def recover_expired(self) -> int:
+        with self._lock:
+            return self._recover_expired_locked(time.time())
+
+    def _recover_expired_locked(self, now: float) -> int:
+        recovered = 0
+        for task_id, record in tuple(self._records.items()):
+            if record.status == "leased" and record.lease_expires_at <= now:
+                self._records[task_id] = TaskRecord(
+                    task=record.task,
+                    status="queued",
+                    attempt=record.attempt,
+                    error="task lease expired",
+                    updated_at=now,
+                )
+                self._lease_tokens.pop(task_id, None)
+                recovered += 1
+        return recovered
+
+    def _claim_is_current(
+        self,
+        record: TaskRecord | None,
+        claim: ClaimedTask,
+        *,
+        now: float,
+    ) -> bool:
+        return bool(
+            record is not None
+            and record.status == "leased"
+            and record.worker_id == claim.worker_id
+            and record.attempt == claim.attempt
+            and self._lease_tokens.get(claim.task.task_id) == claim.lease_token
+            and record.lease_expires_at > now
+        )
+
+    def cancel(self, task_id: str, *, reason: str = "cancelled") -> bool:
+        with self._lock:
+            current = self._records.get(str(task_id))
+            if current is None or current.final:
+                return False
+            self._records[str(task_id)] = TaskRecord(
+                task=current.task,
+                status="cancelled",
+                attempt=current.attempt,
+                error=str(reason),
+                updated_at=time.time(),
+            )
+            self._lease_tokens.pop(str(task_id), None)
+            return True
+
+    def wait_result(
+        self,
+        task_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 0.05,
+    ) -> TaskResult | None:
+        deadline = None if timeout_seconds is None else time.monotonic() + max(0.0, float(timeout_seconds))
+        poll = max(0.001, float(poll_interval_seconds))
+        while True:
+            record = self.get(task_id)
+            if record is None:
+                raise TaskTransportError(f"Unknown task_id='{task_id}'")
+            if record.final:
+                return record.result
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(poll)
+
+    def counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self._lock:
+            for record in self._records.values():
+                counts[record.status] = counts.get(record.status, 0) + 1
+        return counts
 
 
 class SQLiteTaskTransport:

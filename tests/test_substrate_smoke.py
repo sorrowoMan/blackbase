@@ -20,7 +20,6 @@ from blackbase.project.scaffold import add_case, create_project
 from blackbase.resources import (
     InMemoryResourceScheduler,
     PoolScheduler,
-    PoolTaskResult,
     ResourceBudgetError,
     ResourceContext,
     ResourceAllocator,
@@ -87,15 +86,19 @@ def test_project_l0_allocator_enforces_aggregate_active_lease_budget() -> None:
     assert second.threads == 2
 
 
-def test_pool_scheduler_new_and_legacy_submit() -> None:
+def test_pool_scheduler_submit_with_explicit_capacity_metadata() -> None:
     pool = PoolScheduler(total_threads=2)
     try:
         assert pool.submit(lambda x: x + 1, 41).result(timeout=5) == 42
 
-        legacy = pool.submit("task_a", 2, lambda x: x * 2, 21).result(timeout=5)
-        assert isinstance(legacy, PoolTaskResult)
-        assert legacy.task_id == "task_a"
-        assert legacy.result == 42
+        submitted = pool.submit(
+            lambda x: x * 2,
+            21,
+            resource_permits=2,
+            task_id="task_a",
+        )
+        assert submitted.task_id == "task_a"
+        assert submitted.result(timeout=5) == 42
         assert pool.report()["tasks_completed"] == 2
     finally:
         pool.close()
@@ -216,8 +219,9 @@ def test_project_substrate_add_case_runner_and_doctor(tmp_path) -> None:
     for case_root in (solver_case, trainer_case):
         assert (case_root / "build_trainer.py").read_text(encoding="utf-8") == expected_build_alias
         assert (case_root / "run_trainer.py").read_text(encoding="utf-8") == expected_run_alias
-        assert "load_resource_context_from_env" in (case_root / "run_solver.py").read_text(encoding="utf-8")
-        assert "print_resource_context_summary" in (case_root / "run_solver.py").read_text(encoding="utf-8")
+        run_source = (case_root / "run_solver.py").read_text(encoding="utf-8")
+        assert "run_standard_case_cli" in run_source
+        assert "from .build_solver" not in run_source
         pipeline_main = case_root / "pipeline" / "main.py"
         assert pipeline_main.is_file()
         assert "def build_pipeline" in pipeline_main.read_text(encoding="utf-8")

@@ -7,7 +7,7 @@ the same keys. This file is intentionally small and stable.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Sequence
+from typing import Iterable, Sequence
 
 # ---------------------------------------------------------------------------
 # Generic keys (shared between NSGABlack and MLBlack)
@@ -61,6 +61,9 @@ KEY_UNIT_TASKS = "unit_tasks"
 KEY_ADAPTER_NAME = "adapter_name"
 KEY_ADAPTER_CURRENT_SCORE = "adapter_current_score"
 KEY_ADAPTER_BEST_SCORE = "adapter_best_score"
+KEY_ADAPTER_BEST_X = "adapter_best_x"
+KEY_ADAPTER_BEST_OBJECTIVES = "adapter_best_objectives"
+KEY_RUNTIME_PROJECTION_AUDIT = "runtime_projection_audit"
 KEY_DYNAMIC = "dynamic"
 KEY_PHASE_ID = "phase_id"
 KEY_COMPANION_PHASE_INDEX = "companion_phase_index"
@@ -312,6 +315,7 @@ KEY_SNAPSHOT_KEY = "snapshot_key"
 KEY_SNAPSHOT_BACKEND = "snapshot_backend"
 KEY_SNAPSHOT_SCHEMA = "snapshot_schema"
 KEY_SNAPSHOT_META = "snapshot_meta"
+KEY_BEST_CANDIDATE_REF = "best_candidate_ref"
 KEY_POPULATION_REF = "population_ref"
 KEY_OBJECTIVES_REF = "objectives_ref"
 KEY_CONSTRAINT_VIOLATIONS_REF = "constraint_violations_ref"
@@ -342,7 +346,9 @@ CANONICAL_CONTEXT_KEYS = {
     KEY_STRATEGY, KEY_STRATEGY_ID, KEY_SHARED, KEY_ROLE, KEY_ROLE_INDEX,
     KEY_ROLE_ADAPTER, KEY_TASK, KEY_REPORT, KEY_ROLE_REPORTS, KEY_CANDIDATE_ROLES,
     KEY_CANDIDATE_UNITS, KEY_UNIT_TASKS, KEY_ADAPTER_NAME, KEY_ADAPTER_CURRENT_SCORE,
-    KEY_ADAPTER_BEST_SCORE, KEY_DYNAMIC, KEY_PHASE_ID, KEY_COMPANION_PHASE_INDEX,
+    KEY_ADAPTER_BEST_SCORE, KEY_ADAPTER_BEST_X, KEY_ADAPTER_BEST_OBJECTIVES,
+    KEY_RUNTIME_PROJECTION_AUDIT,
+    KEY_DYNAMIC, KEY_PHASE_ID, KEY_COMPANION_PHASE_INDEX,
     KEY_COMPANION_TRIGGER_REASON, KEY_COMPANION_NEXT_ELIGIBLE_GENERATION,
     KEY_COMPANION_PHASE_COUNT_USED, KEY_STAGE_INDEX, KEY_STAGE_NAME, KEY_STAGE_TOTAL,
     KEY_STAGE_ARTIFACTS, KEY_STAGE_ARTIFACT_PREFIX, KEY_STAGE_STATUS,
@@ -426,7 +432,7 @@ CANONICAL_CONTEXT_KEYS = {
     KEY_CROSSOVER_RATE, KEY_CONTEXT_SCHEMA, KEY_CONTEXT_EVENTS, KEY_CONTEXT_CACHE,
     KEY_DECISION_TRACE, KEY_CHECKPOINT_LATEST_PATH, KEY_CHECKPOINT_LAST_LOADED_PATH,
     KEY_BIAS_CACHE_FINGERPRINT, KEY_SNAPSHOT_KEY, KEY_SNAPSHOT_BACKEND,
-    KEY_SNAPSHOT_SCHEMA, KEY_SNAPSHOT_META, KEY_POPULATION_REF, KEY_OBJECTIVES_REF,
+    KEY_SNAPSHOT_SCHEMA, KEY_SNAPSHOT_META, KEY_BEST_CANDIDATE_REF, KEY_POPULATION_REF, KEY_OBJECTIVES_REF,
     KEY_CONSTRAINT_VIOLATIONS_REF, KEY_PARETO_SOLUTIONS_REF, KEY_PARETO_OBJECTIVES_REF,
     KEY_HISTORY_REF, KEY_DECISION_TRACE_REF, KEY_SEQUENCE_GRAPH_REF,
     KEY_BACKEND_WARM_START_REF, KEY_BACKEND_SOLUTION_POOL_REF, KEY_BACKEND_DIAGNOSTIC_REF,
@@ -434,57 +440,8 @@ CANONICAL_CONTEXT_KEYS = {
 }
 
 CONTEXT_KEY_SET = frozenset(CANONICAL_CONTEXT_KEYS)
-
-# Compatibility aliases for older prototype strings
-CONTEXT_KEY_ALIASES: Dict[str, str] = {
-    # NSGABlack aliases
-    "bestx": KEY_BEST_X,
-    "bestobjective": KEY_BEST_OBJECTIVE,
-    "best-objective": KEY_BEST_OBJECTIVE,
-    "bestobj": KEY_BEST_OBJECTIVE,
-    "bestf": KEY_BEST_OBJECTIVE,
-    "mutationsigma": KEY_MUTATION_SIGMA,
-    "mutation-sigma": KEY_MUTATION_SIGMA,
-    "vnsk": KEY_VNS_K,
-    "vns-k": KEY_VNS_K,
-    "vns.k": KEY_VNS_K,
-    "moeadsubproblem": KEY_MOEAD_SUBPROBLEM,
-    "moead_weight": KEY_MOEAD_WEIGHT,
-    "moead-neighbor-mode": KEY_MOEAD_NEIGHBOR_MODE,
-    "singletrajstate": KEY_SINGLE_TRAJ_STATE,
-    "singletrajsigma": KEY_SINGLE_TRAJ_SIGMA,
-    "adaptername": KEY_ADAPTER_NAME,
-    "adaptercurrentscore": KEY_ADAPTER_CURRENT_SCORE,
-    "adapterbestscore": KEY_ADAPTER_BEST_SCORE,
-    "eventqueue": KEY_EVENT_QUEUE,
-    "eventinflight": KEY_EVENT_INFLIGHT,
-    "biascachefingerprint": KEY_BIAS_CACHE_FINGERPRINT,
-    "snapshotkey": KEY_SNAPSHOT_KEY,
-    "snapshotbackend": KEY_SNAPSHOT_BACKEND,
-    "snapshotschema": KEY_SNAPSHOT_SCHEMA,
-    "snapshotmeta": KEY_SNAPSHOT_META,
-    "populationref": KEY_POPULATION_REF,
-    "objectivesref": KEY_OBJECTIVES_REF,
-    "constraintviolationsref": KEY_CONSTRAINT_VIOLATIONS_REF,
-    "paretosolutionsref": KEY_PARETO_SOLUTIONS_REF,
-    "paretoobjectivesref": KEY_PARETO_OBJECTIVES_REF,
-    "historyref": KEY_HISTORY_REF,
-    "decisiontraceref": KEY_DECISION_TRACE_REF,
-    "sequencegraphref": KEY_SEQUENCE_GRAPH_REF,
-    
-    # MLBlack aliases
-    "candidate": KEY_CANDIDATE_UNKNOWN_STATE,
-    "feedback": KEY_POPULATION_FEEDBACK,
-    "gradients": KEY_FEEDBACK_GRADIENTS,
-    "objectives": KEY_FEEDBACK_OBJECTIVES,
-    "metrics": KEY_FEEDBACK_METRICS,
-    "resources": KEY_RESOURCE_CONTEXT,
-    "resource": KEY_RESOURCE_CONTEXT,
-    "snapshot": KEY_SNAPSHOT_REF,
-    "data.xtrain": KEY_DATA_X_TRAIN,
-    "data.xvalid": KEY_DATA_X_VALID,
-    "problem.data.xtrain": KEY_PROBLEM_DATA_X_TRAIN,
-    "pipeline.slotcontext": KEY_PIPELINE_SLOT_CONTEXT,
+_CANONICAL_CONTEXT_KEY_BY_CASEFOLD = {
+    key.casefold(): key for key in CANONICAL_CONTEXT_KEYS
 }
 
 # Standard metrics registry
@@ -506,15 +463,12 @@ METRIC_FALLBACKS: tuple[str, ...] = ("strict", "safe_zero", "nan", "skip")
 
 
 def normalize_context_key(key: str) -> str:
-    """Normalize a context key to its canonical form."""
+    """Normalize casing and whitespace without guessing another field name."""
     text = str(key).strip()
     if not text:
         return ""
-    lowered = text.lower()
-    if lowered in CANONICAL_CONTEXT_KEYS:
-        return lowered
-    normalized = lowered.replace(" ", "").replace("_", "").replace("-", "")
-    return CONTEXT_KEY_ALIASES.get(normalized, lowered)
+    lowered = text.casefold()
+    return _CANONICAL_CONTEXT_KEY_BY_CASEFOLD.get(lowered, lowered)
 
 
 def normalize_context_keys(keys: Iterable[str] | None) -> tuple[str, ...]:

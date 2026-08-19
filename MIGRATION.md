@@ -1,337 +1,128 @@
-# BlackBase Migration Guide
+# BlackBase 0.3 迁移说明
 
-## Overview
+## 版本与边界
 
-BlackBase is the shared Project / Case / Scaffold / L0 substrate for NSGABlack and MLBlack. It owns shared runtime contracts such as context, snapshot, resource grants, local L0 pools, pipeline slot kernels, and cross-case protocol types.
+BlackBase 0.3 是一次有意的边界收口，不再提供旧仓库路径的转发层。
 
-Architectural boundary:
+- `blackbase==0.3.x`：Project / Case / Scaffold、L0 资源、Context / Snapshot、公共调用绑定、Pipeline 编排、Catalog 与运行协议。
+- `nsgablack==0.3.x`：Solver、搜索 Adapter、Representation、Pareto、目标与约束等优化语义。
+- `mlblack==0.3.x`：Trainer、DataView、Codec、Head、Problem、Provider、Artifact 等 ML 语义。
 
-- `blackbase` owns shared substrate contracts.
-- `nsgablack` owns optimization/search semantics.
-- `mlblack` owns machine-learning semantics.
-- orchestration and resource grants belong to the shared substrate, not to either semantic layer privately.
+下游依赖应声明：
 
-## Migration Timeline
-
-| Phase | Description | Target |
-|-------|-------------|--------|
-| Phase 1 | Use adapters (backward compatible) | Current |
-| Phase 2 | Direct imports from blackbase | v0.2.0 |
-| Phase 3 | Remove legacy wrappers | v1.0.0 |
-
----
-
-## Phase 1: Using Adapters (Current)
-
-The adapter layer provides full backward compatibility with deprecation warnings.
-
-### NSGABlack
-
-#### Context Module
-
-**Before (Legacy):**
-```python
-from nsgablack.core.state.context_keys import normalize_context_key
-from nsgablack.core.state.context_contracts import ContextContract
-from nsgablack.core.state.context_store import ContextStore, InMemoryContextStore
+```toml
+blackbase = ">=0.3.3,<0.4.0"
 ```
 
-**After (Adapter):**
-```python
-# Option 1: Use adapter (with deprecation warning)
-from blackbase.adapters.nsgablack.context import (
-    normalize_context_key,
-    ContextContract,
-    ContextStore,
-    InMemoryContextStore,
-)
+0.3.3 增加 CandidateBatch 语义/数值双视图、StateRef trajectory 与正式 StateRelease；0.3.2 增加 Problem Evaluation Provider 的正式状态协议：`StateRef` 只表示
+Provider 进程内活状态；Adapter 通过版本栅栏 `StateTransitionRequest` 选择更新机制，
+再通过 `StateMaterializationRequest` 导出 `UnknownState` 或 `DataRef`。旧进程活引用
+不能作为 checkpoint 或 Artifact 恢复。
 
-# Option 2: Direct import from blackbase (recommended for new code)
-from blackbase.context import (
-    normalize_context_key,
-    ContextContract,
-    ContextStore,
-)
+## 需要修改的导入
+
+共享底座类型必须直接从 BlackBase 导入：
+
+```python
+from blackbase.context import ContextContract, ContextStore, SnapshotStore
+from blackbase.resources import PoolScheduler, ResourceContext
+from blackbase.project import CaseRunRequest, CaseRunResult, CaseStageRunner
+from blackbase.call_binding import CallCandidate, invoke_bound_once
 ```
 
-#### Resources Module
+以下转发路径已删除：
 
-**Before (Legacy):**
+- `blackbase.adapters.*`
+- `nsgablack.core.resources.*`
+- `nsgablack.utils.context.*`
+- `mlblack.core.resources.*`
+- `mlblack.core.context_contracts`
+- `mlblack.core.context_keys`
+- `mlblack.core.stores`
+- `blackbase.compat`
+
+`nsgablack.core.state` 仍是优化层的正式状态 API；它包含 incumbent 与 candidate provenance 等优化语义，不是 BlackBase 转发兼容层。
+
+## 公共调用绑定
+
+旧的 `CallForm` / `invoke_compatible_once()` 已删除。需要兼容多个明确签名时，使用公共绑定协议：
+
 ```python
-from nsgablack.core.resources.model import (
-    DataRef,
-    ResourceRequirement,
-    WorkerDescriptor,
-    TaskEnvelope,
+from blackbase.call_binding import CallCandidate, invoke_bound_once
+
+result = invoke_bound_once(
+    operator,
+    (
+        CallCandidate(args=(control, value), label="control,value"),
+        CallCandidate(args=(value,), label="value"),
+    ),
 )
 ```
 
-**After (Adapter):**
+该协议先用函数签名绑定，再执行唯一匹配项。函数体内部抛出的 `TypeError` 不会触发第二次调用。
+
+## Pipeline 与 Plugin
+
+- 使用 `PipelineOrchestrator.call_operator()` 与 `run_policy()`；旧私有别名已删除。
+- Plugin 的公共基类是 `PluginBase`；`Plugin` 别名已删除。
+- ML `Capability` 直接继承 `PluginBase`，不再通过 `CapabilityPluginAdapter` 包装。
+- Adapter 运行投影只使用 `get_runtime_context_projection(control)`；旧 `get_context_projection()` 钩子已删除。
+
+## ContextContract
+
+构造参数只接受紧凑字段：
+
 ```python
-# Option 1: Use adapter
-from blackbase.adapters.nsgablack.resources import (
-    DataRef,
-    ResourceRequirement,
-    WorkerDescriptor,
-    TaskEnvelope,
+ContextContract(
+    requires=("candidate",),
+    optional=("metrics",),
+    provides=("feedback",),
+    mutates=(),
+    cache=(),
 )
-
-# Option 2: Direct import from blackbase
-from blackbase.resources import (
-    DataRef,
-    ResourceRequirement,
-    WorkerDescriptor,
-    TaskEnvelope,
-)
 ```
 
-#### Kernel/Representation Module
+组件类仍以 `context_requires`、`context_optional`、`context_provides`、`context_mutates`、`context_cache` 声明静态契约。旧的实例属性别名与构造参数别名已删除。
 
-**Before (Legacy):**
-```python
-from nsgablack.representation.base import RepresentationPipeline
-```
+## PoolScheduler
 
-**After (Adapter):**
-```python
-# Use adapter with backward-compatible wrapper
-from blackbase.adapters.nsgablack.kernel import RepresentationPipeline
-```
-
----
-
-### MLBlack
-
-#### Context Module
-
-**Before (Legacy):**
-```python
-from mlblack.core.context_contracts import ContextContract
-from mlblack.core.stores import InMemoryContextStore
-```
-
-**After (Adapter):**
-```python
-# Option 1: Use adapter
-from blackbase.adapters.mlblack.context import (
-    ContextContract,
-    InMemoryContextStore,
-)
-
-# Option 2: Direct import from blackbase
-from blackbase.context import ContextContract
-```
-
-#### Resources Module
-
-**Before (Legacy):**
-```python
-from mlblack.core.resources._resources import ResourceContext
-```
-
-**After (Adapter):**
-```python
-# Option 1: Use adapter
-from blackbase.adapters.mlblack.resources import ResourceContext
-
-# Option 2: Direct import from blackbase
-from blackbase.resources import ResourceContext
-```
-
----
-
-## Phase 2: Direct Imports (v0.2.0)
-
-After adapter deprecation warnings are resolved, migrate to direct imports:
+`submit()` 只返回任务函数的原始结果：
 
 ```python
-# Replace
-from blackbase.adapters.nsgablack.context import ContextStore
-
-# With
-from blackbase.context import ContextStore
+handle = pool.submit(fn, value, resource_permits=1, task_id="job-1")
+result = handle.result()
 ```
 
----
+旧 `PoolTaskResult` 包装已删除；`task_id` 只属于任务句柄元数据。
 
-## API Mapping Reference
+## Representation 与 incumbent
 
-### Context Keys
+- nsgablack Representation 的正式初始化入口为 `init(context)`；`context` 必须包含正式 Problem。
+- `initialize()` / `transform()` 原型入口已删除。
+- `IncumbentState` 是最佳候选、目标、约束、分数、策略和来源的唯一原子权威状态。
+- `set_best_snapshot()` 与零散 best 字段回退已删除；不完整的旧 checkpoint 不再被伪造成可验证 incumbent。
+- checkpoint v2 保存选择策略、退化审计、投影审计和 run lineage；v1 仅通过显式迁移读取。
 
-| Legacy (NSGABlack) | Legacy (MLBlack) | BlackBase |
-|-------------------|-------------------|-----------|
-| `requires` | `context_requires` | `requires` |
-| `provides` | `context_provides` | `provides` |
-| `mutates` | `context_mutates` | `mutates` |
-| `cache` | `context_cache` | `cache` |
+## 完整子 Case
 
-Both naming conventions are supported in BlackBase.
+父 Case 调用子 Case 必须使用公共 `CaseRunRequest` / `CaseRunResult` 信封。BlackBase 负责：
 
-### Context Store
+- 父子 lineage 与 attempt 身份；
+- deadline / cancellation 链；
+- `ChildResourceGrant` 与预算委托结算；
+- Artifact/DataRef 注入；
+- 串行、进程和外部 Worker 的统一执行信封；
+- 结构化失败与 Manifest 记录。
 
-| Legacy | BlackBase |
-|--------|-----------|
-| `InMemoryContextStore` | `ContextStore` (default backend) |
-| `RedisContextStore` | `RedisContextStore` |
-| `create_context_store()` | `create_context_store()` |
+`TaskInnerRuntimeEvaluator` 一类低层组件调用器不能替代完整子 Case；当子任务需要独立身份、资源、预算、Artifact 或失败信封时，必须升级到 Case 协议。
 
-### Resources
+## 验证
 
-| Legacy (NSGABlack) | BlackBase |
-|-------------------|-----------|
-| `DataRef` | `DataRef` |
-| `ResourceRequirement` | `ResourceRequirement` |
-| `WorkerDescriptor` | `WorkerDescriptor` |
-| `TaskEnvelope` | `TaskEnvelope` |
-| `TaskResult` | `TaskResult` |
-| `PoolScheduler` | `PoolScheduler` |
-| `PoolTask` | `PoolTask` |
-| `PoolResult` | `PoolResult` |
-
-### Shared Types
-
-| Legacy (MLBlack) | BlackBase |
-|------------------|-----------|
-| `UnknownState` | `UnknownState` |
-| `Feedback` | `Feedback` |
-| `PopulationSnapshot` | `PopulationSnapshot` |
-| `TrainerResult` | `TrainerResult` |
-
-### Kernel
-
-| Legacy (NSGABlack) | BlackBase |
-|-------------------|-----------|
-| `RepresentationPipeline` | `PipelineKernelBuild` |
-| N/A | `PipelineSlotSpec` |
-| N/A | `PipelineSpec` |
-| N/A | `OrchestrationPolicy` |
-
----
-
-## Key Changes
-
-### 1. Unified Context Keys
-
-All context keys are now in a single registry with both naming styles supported:
-
-```python
-from blackbase.context import normalize_context_key
-
-# Both work now
-key1 = normalize_context_key("candidate.model")      # MLBlack style
-key2 = normalize_context_key("candidate.unknown_state")  # Canonical
+```powershell
+python -m pytest -q
+python -m nsgablack project doctor --path . --strict --format problem
+python -m nsgablack catalog list --profile framework-core --kind adapter
+python -m nsgablack catalog list --profile default --kind example
 ```
 
-### 2. Factory Functions for Stores
-
-Use factory functions instead of direct class instantiation:
-
-```python
-# Before
-store = InMemoryContextStore()
-
-# After
-from blackbase.context import create_context_store
-store = create_context_store(backend="memory")
-```
-
-### 3. Immutable Protocol Objects
-
-All protocol objects are now frozen (immutable):
-
-```python
-from blackbase.resources import DataRef
-
-ref = DataRef(uri="s3://bucket/model.pt")
-# ref.uri = "new-uri"  # Raises FrozenInstanceError
-```
-
-### 4. Pipeline Specs
-
-Pipeline definitions use declarative specs:
-
-```python
-from blackbase.kernel import PipelineSpec, PipelineSlotSpec, build_pipeline_kernel
-
-spec = PipelineSpec(
-    key="my_pipeline",
-    slots=[
-        PipelineSlotSpec(slot="init", operators=["init_op"]),
-        PipelineSlotSpec(slot="mutate", mode="parallel", operators=["mut1", "mut2"]),
-    ],
-)
-
-kernel = build_pipeline_kernel(spec, operator_registry={...})
-```
-
-### 5. Shared Candidate State
-
-`UnknownState` accepts both old metadata spellings:
-
-```python
-from blackbase.types import UnknownState
-
-state_a = UnknownState(values=[1, 2], meta={"source": "old"})
-state_b = UnknownState(values=[1, 2], metadata={"source": "new"})
-state_c = state_b.with_values([3, 4], stage="repair")
-```
-
-Use `blackbase.types.UnknownState` for shared Case payloads. Keep framework-specific model, codec, trainer, or solver semantics in `nsgablack` / `mlblack`.
-
----
-
-## Deprecation Warnings
-
-When using adapters, you'll see warnings like:
-
-```
-DeprecationWarning: nsgablack.core.state.context_keys is deprecated. 
-Use blackbase.context instead. This will be removed in 1.0.0.
-```
-
-To see all deprecation warnings:
-
-```python
-import warnings
-warnings.filterwarnings("always", category=DeprecationWarning)
-```
-
----
-
-## Testing Migration
-
-### Before Migration
-
-```bash
-# Run existing tests
-pytest tests/
-```
-
-### During Migration
-
-```bash
-# Enable all warnings
-python -W always::DeprecationWarning your_script.py
-
-# Check for adapter usage
-grep -r "blackbase.adapters" your_code/
-```
-
-### After Migration
-
-```bash
-# Ensure no adapter imports remain
-grep -r "blackbase.adapters" your_code/
-# Should return nothing
-
-# Run tests with direct imports
-pytest tests/
-```
-
----
-
-## Getting Help
-
-- **Issues**: https://github.com/your-org/blackbase/issues
-- **Discussions**: https://github.com/your-org/blackbase/discussions
-- **Documentation**: https://blackbase.readthedocs.io/
+升级后应再搜索已删除路径，不能依赖导入失败时的隐式回退。

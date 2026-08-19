@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from blackbase.resources import DataRef
 
 from .execution import CaseRunRequest, ProjectConfigurationError
+from .case_binding import case_resource_binding_audit
 
 
 def execute_case_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -115,6 +116,10 @@ def case_runtime_state(case_obj: Any) -> dict[str, Any]:
         "providers": len(tuple(providers())) if callable(providers) else 0,
         "plugins": len(tuple(plugins)),
         "resource_context": _as_dict(getattr(case_obj, "resource_context", None)),
+        "resource_binding": case_resource_binding_audit(case_obj),
+        "component_overrides": _as_dict(
+            getattr(case_obj, "component_override_audit", None)
+        ),
     }
 
 
