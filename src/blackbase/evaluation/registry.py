@@ -221,6 +221,12 @@ class BoundStateTransitionProvider:
                 f"from '{request.method_id}' to '{result.method_id}'"
             )
         _validate_transition_successor(request, result)
+        result_contract_error = _transition_result_contract_mismatch(
+            self.method_spec,
+            result,
+        )
+        if result_contract_error:
+            raise EvaluationProviderContractError(result_contract_error)
         missing_result_slots = sorted(
             set(self.method_spec.result_slots).difference(result.slot_refs)
         )
@@ -884,7 +890,67 @@ def _transition_request_contract_mismatch(
                 f"transition method '{method_spec.method_id}' received undeclared "
                 f"{label}: {unexpected}"
             )
+    inline_operands = set(method_spec.inline_operands)
+    for name, allowed_kinds in method_spec.operand_state_kinds.items():
+        if name not in request.operands:
+            continue
+        refs = tuple(_iter_nested_state_refs(request.operands[name]))
+        if not refs and name not in inline_operands:
+            return (
+                f"transition operand '{name}' requires a StateRef with kind in "
+                f"{list(allowed_kinds)}"
+            )
+        invalid = sorted(
+            {
+                str(ref.state_kind)
+                for ref in refs
+                if str(ref.state_kind).strip().lower() not in set(allowed_kinds)
+            }
+        )
+        if invalid:
+            return (
+                f"transition operand '{name}' has unsupported StateRef kinds "
+                f"{invalid}; expected={list(allowed_kinds)}"
+            )
+    for name, allowed_kinds in method_spec.slot_state_kinds.items():
+        ref = request.slot_refs.get(name)
+        if ref is None:
+            continue
+        if str(ref.state_kind).strip().lower() not in set(allowed_kinds):
+            return (
+                f"transition slot '{name}' has StateRef kind '{ref.state_kind}'; "
+                f"expected={list(allowed_kinds)}"
+            )
     return None
+
+
+def _transition_result_contract_mismatch(
+    method_spec: StateTransitionMethodSpec,
+    result: StateTransitionResult,
+) -> str | None:
+    for name, allowed_kinds in method_spec.result_slot_state_kinds.items():
+        ref = result.slot_refs.get(name)
+        if ref is None:
+            continue
+        if str(ref.state_kind).strip().lower() not in set(allowed_kinds):
+            return (
+                f"transition result slot '{name}' has StateRef kind "
+                f"'{ref.state_kind}'; expected={list(allowed_kinds)}"
+            )
+    return None
+
+
+def _iter_nested_state_refs(value: Any):
+    if isinstance(value, StateRef):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_nested_state_refs(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_nested_state_refs(item)
 
 
 def _validate_transition_successor(

@@ -126,7 +126,7 @@ try:
 
     feedback = Feedback(objectives=[0.5], constraints=[0.0])
     assert feedback.ok
-    print("[OK] Feedback works: score={}".format(feedback.scalar_score()))
+    print("[OK] Feedback works: objectives={}".format(feedback.objectives.tolist()))
 
 except Exception as e:
     print("[FAIL] Shared protocol types failed: {}".format(e))

@@ -110,12 +110,13 @@ deadline/cancellation。预算通过可序列化 handle 委派，子 Case 未使
 
 - `PluginBase` / `PluginManager` 提供两边共享的注册、优先级、严格模式、事件调度与评估 hook。
 - `on_context_build` 按插件顺序链式传递 context；插件返回的新字典会成为下一个插件的输入。
-- `CapabilityPluginAdapter` 把旧 mlblack `on_fit_* / on_step_*` Capability 映射到统一 Plugin 生命周期，同时保留 Trainer、context、step row 与 report。
+- mlblack `Capability` 直接实现共享 `PluginBase` 生命周期；旧的 `CapabilityPluginAdapter` 已删除。
 - population snapshot、Pareto 等搜索专用 helper 仍留在 nsgablack；DataView、Trainer、Artifact 等 ML 语义仍留在 mlblack。
 
 ### Shared Types
 
 - `UnknownState`
+- `CandidateBatch`
 - `Feedback`
 - `StateRef`
 - `PopulationSnapshot`
@@ -141,9 +142,13 @@ artifact authority.
 
 ## 共享协议版本
 
-当前三仓共享底座基线为 `blackbase 0.3.3`。`nsgablack` 与 `mlblack`
-必须声明 `blackbase>=0.3.3,<0.4.0`；该下限包含 CandidateBatch 双视图、StateRelease、trajectory lineage 和正式 Evaluation Provider、
+当前三仓共享底座基线为 `blackbase 0.3.6`。`nsgablack` 与 `mlblack`
+必须声明 `blackbase>=0.3.6,<0.4.0`；该下限包含 canonical Case 无兼容层 Doctor、递归不可变 Feedback、具备 operand/slot state-kind 契约的 transition method、build-check 资源清理，以及不可变 CandidateBatch 双视图、StateRelease、trajectory lineage 和正式 Evaluation Provider、
 StateRef transition 与 materialization 协议。
+
+`Feedback` 只承载语义证据，不提供默认 objective scalarization。需要把多目标
+Feedback 投影为单值时，调用方必须显式装配 projector/scalarizer；共享协议不会使用
+目标均值或固定 constraint penalty 替算法作决定。
 
 0.3 完成了共享底座的干净边界：删除两侧资源、Context 与 Adapter 转发树；
 公共调用绑定、Pipeline 编排、Catalog、Case stage、任务运行后端均由 BlackBase

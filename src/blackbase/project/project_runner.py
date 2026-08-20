@@ -329,6 +329,53 @@ def execute_project(
                 if mode == "cli":
                     if check and "--check" not in argv:
                         argv = ("--check", *argv)
+                    if check and build_check:
+                        # A build check validates the canonical builder contract.  Do
+                        # that directly instead of cold-starting one Python process per
+                        # CLI Case; the CLI entry remains the authority for real runs.
+                        build_request = replace(
+                            effective_request,
+                            mode="build",
+                            argv=argv,
+                            metadata={
+                                **dict(effective_request.metadata),
+                                "check_only": True,
+                                "configured_mode": "cli",
+                                "execution_mode": "build_check",
+                            },
+                        )
+                        result = CaseExecutor(
+                            root,
+                            extra_python_paths=extra_python_paths,
+                        ).execute(build_request)
+                        lease_guard.assert_current()
+                        runtime_state = dict(result.metadata.get("runtime_state", {}) or {})
+                        _print_project_check(
+                            project_name=project_name,
+                            stage_name=stage_name,
+                            case_name=case_name,
+                            mode=case_kind,
+                            request=request,
+                            resource_context=resource_context,
+                            state={**runtime_state, **external_audit},
+                            label="project-check",
+                        )
+                        retain(result)
+                        if not result.ok:
+                            exit_code = exit_code or result.exit_code or 1
+                            _print_project_message(
+                                {
+                                    "project": project_name,
+                                    "stage": stage_name,
+                                    "case": case_name,
+                                    "mode": "build_check_error",
+                                    "error": result.error,
+                                },
+                                label="project-error",
+                            )
+                            if _stage_fail_fast(stage):
+                                return finish(exit_code)
+                        continue
                     _print_project_check(
                         project_name=project_name,
                         stage_name=stage_name,
@@ -339,7 +386,7 @@ def execute_project(
                         label="project-check" if check else "project-runtime",
                     )
                     rc = 0
-                    if build_check or not check:
+                    if not check:
                         rc = _run_case_cli(
                             project_root=root,
                             case_name=case_name,

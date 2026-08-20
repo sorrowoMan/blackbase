@@ -45,6 +45,7 @@ from .execution import (
 from .runtime import (
     build_case,
     case_import_context,
+    close_case_after_build_check,
     load_case_builder,
     load_case_resource_request,
     run_case,
@@ -866,7 +867,10 @@ class CaseExecutor:
                 case_runtime_state(case_obj),
                 path="runtime_state",
             )
+            build_check_cleanup = {"status": "not_required", "hook": None}
             if bool(request.metadata.get("check_only", False)):
+                phase = "cleanup"
+                build_check_cleanup = close_case_after_build_check(case_obj)
                 output = {}
                 result_status = "built"
             else:
@@ -909,6 +913,7 @@ class CaseExecutor:
                 metadata={
                     "runtime_state": runtime_state,
                     "runtime_audit": runtime_context.audit(),
+                    "build_check_cleanup": build_check_cleanup,
                 },
             )
         except CaseDeadlineExceeded as exc:

@@ -189,6 +189,35 @@ def test_candidate_batch_keeps_semantic_and_numeric_views_aligned() -> None:
     assert restored.semantic_states[1].metadata["architecture"] == "b"
 
 
+def test_candidate_batch_views_remain_immutable_after_validation() -> None:
+    source_values = np.array([1.0, 2.0])
+    source_metadata = {"architecture": {"layers": [2, 4]}}
+    batch = CandidateBatch.from_candidates(
+        (UnknownState(source_values, metadata=source_metadata),),
+        candidate_tokens=("candidate:1",),
+    )
+
+    source_values[0] = 99.0
+    source_metadata["architecture"]["layers"][0] = 99
+    assert batch.semantic_states[0].as_array().tolist() == [1.0, 2.0]
+    assert batch.numeric_matrix.tolist() == [[1.0, 2.0]]
+    assert tuple(batch.semantic_states[0].metadata["architecture"]["layers"]) == (2, 4)
+
+    with pytest.raises(ValueError):
+        batch.semantic_states[0].values[0] = 9.0
+    with pytest.raises(ValueError):
+        batch.numeric_matrix[0, 0] = 9.0
+    with pytest.raises(TypeError):
+        batch.semantic_states[0].metadata["architecture"] = {"layers": [9]}
+    with pytest.raises(TypeError):
+        batch.semantic_states[0].metadata["architecture"]["layers"] = (9,)
+
+    with pytest.raises(ValueError):
+        batch.semantic_states[0].values.setflags(write=True)
+    with pytest.raises(ValueError):
+        batch.numeric_matrix.setflags(write=True)
+
+
 def test_state_release_is_bound_to_provider_scope_and_trajectory() -> None:
     provider = ReleaseRecordingProvider(
         EvaluationProviderSpec(provider_id="torch.release/v1", compute_backend="torch")
@@ -579,7 +608,7 @@ def test_provider_internal_type_error_is_not_retried() -> None:
     assert provider.calls == 1
 
 
-def test_bound_evaluation_rejects_mutated_request_payload() -> None:
+def test_bound_evaluation_state_cannot_be_mutated_after_binding() -> None:
     provider = RecordingProvider(
         EvaluationProviderSpec(
             provider_id="numpy.loss/v1",
@@ -599,12 +628,13 @@ def test_bound_evaluation_rejects_mutated_request_payload() -> None:
         request,
         ResourceContext(grant={"threads": 1, "gpus": 0}),
     )
-    state.values[0] = 2.0
+    with pytest.raises(ValueError):
+        state.values[0] = 2.0
 
-    with pytest.raises(EvaluationProviderContractError, match="payload changed"):
-        bound.evaluate(request)
+    result = bound.evaluate(request)
 
-    assert provider.calls == 0
+    assert len(result.feedback) == 1
+    assert provider.calls == 1
 
 
 def test_bound_provider_rejects_wrong_feedback_cardinality() -> None:
@@ -649,10 +679,13 @@ def test_state_transition_executes_owner_kernel_and_versions_state_and_slots() -
                 StateTransitionMethodSpec(
                     method_id="gradient.adam",
                     required_operands=("gradient",),
+                    operand_state_kinds={"gradient": ("gradient",)},
                     required_parameters=("learning_rate",),
                     optional_parameters=("beta1", "beta2"),
                     optional_slots=("m", "v"),
                     result_slots=("m",),
+                    slot_state_kinds={"m": ("optimizer_slot",)},
+                    result_slot_state_kinds={"m": ("optimizer_slot",)},
                 ),
                 "gradient.sgd",
             ),
@@ -666,6 +699,10 @@ def test_state_transition_executes_owner_kernel_and_versions_state_and_slots() -
         "gradient.adam",
         "gradient.sgd",
     )
+    restored_adam = restored_spec.transition_method("gradient.adam")
+    assert restored_adam is not None
+    assert restored_adam.operand_state_kinds["gradient"] == ("gradient",)
+    assert restored_adam.result_slot_state_kinds["m"] == ("optimizer_slot",)
     state_ref = StateRef(
         provider_id="torch.autograd/v1",
         state_id="parameters-1",
@@ -830,6 +867,55 @@ def test_structured_transition_method_rejects_missing_operand_before_execution()
     assert "missing required operands" in error.value.rejections[
         "numpy.structured/v1"
     ]
+    assert provider.transition_calls == 0
+
+
+def test_structured_transition_method_rejects_wrong_operand_state_kind() -> None:
+    provider = TransitionRecordingProvider(
+        EvaluationProviderSpec(
+            provider_id="numpy.typed/v1",
+            state_kinds=("model_parameters",),
+            transition_methods=(
+                StateTransitionMethodSpec(
+                    method_id="gradient.sgd",
+                    required_operands=("gradient",),
+                    operand_state_kinds={"gradient": ("gradient",)},
+                    required_parameters=("learning_rate",),
+                ),
+            ),
+        )
+    )
+    registry = EvaluationProviderRegistry()
+    registry.register(provider)
+    state_ref = StateRef(
+        provider_id=provider.spec.provider_id,
+        state_id="parameters-1",
+        state_kind="model_parameters",
+        scope_id="run.scope",
+        trajectory_id="trajectory-1",
+    )
+    request = StateTransitionRequest(
+        state_ref=state_ref,
+        method_id="gradient.sgd",
+        operands={
+            "gradient": StateRef(
+                provider_id=provider.spec.provider_id,
+                state_id="direction-1",
+                state_kind="search_direction",
+                scope_id=state_ref.scope_id,
+                trajectory_id=state_ref.trajectory_id,
+            )
+        },
+        parameters={"learning_rate": 0.1},
+    )
+
+    with pytest.raises(EvaluationProviderUnavailable) as error:
+        registry.bind_transition(
+            request,
+            ResourceContext(grant={"threads": 1, "gpus": 0}),
+        )
+
+    assert "unsupported StateRef kinds" in error.value.rejections[provider.spec.provider_id]
     assert provider.transition_calls == 0
 
 

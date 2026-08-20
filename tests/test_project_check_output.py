@@ -181,3 +181,112 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
     report = run_common_project_doctor(project_root, strict=True)
 
     assert any(item.code == "case-build-returns-collection" for item in report.diagnostics)
+
+
+def test_doctor_rejects_migrated_runpy_wrapper(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("legacy", "trainer", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        "import runpy\n\n"
+        "class MigratedExampleRunner:\n"
+        "    pass\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return MigratedExampleRunner()\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-migrated-wrapper-forbidden"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_compatibility_marker_and_does_not_exempt_wrapper(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("legacy", "trainer", project_root=project_root)
+    marker = case_root / ".case"
+    marker.write_text(
+        marker.read_text(encoding="utf-8") + "compatibility = true\n",
+        encoding="utf-8",
+    )
+    (case_root / "build_solver.py").write_text(
+        "import runpy\n\n"
+        "class MigratedExampleRunner:\n"
+        "    pass\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return MigratedExampleRunner()\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-compatibility-marker-forbidden"
+        for item in report.diagnostics
+    )
+    assert any(
+        item.code == "case-migrated-wrapper-forbidden"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_private_case_control_wrapper(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("hidden", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        "from dataclasses import dataclass\n\n"
+        "@dataclass\n"
+        "class HiddenOuterCase:\n"
+        "    def run(self):\n"
+        "        return {}\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return HiddenOuterCase()\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-private-control-wrapper-forbidden"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_compatibility_assembly_source(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("legacy", "trainer", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        '"""Compatibility assembly for an old runner."""\n\n'
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return object()\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-compatibility-source-forbidden"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_ignores_cache_only_case_residue_but_rejects_missing_declared_case(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    cache_only = project_root / "cases" / "removed_case" / "__pycache__"
+    cache_only.mkdir(parents=True)
+    (cache_only / "build_solver.pyc").write_bytes(b"cache")
+    (project_root / "project_config.py").write_text(
+        "STAGES = [{'name': 'main', 'cases': ['missing_case']}]\n"
+        "GROUPS = {'default': {'stages': ['main']}}\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(item.code == "project-stage-case-missing" for item in report.diagnostics)
+    assert not any(
+        item.path and "removed_case" in item.path and item.level == "error"
+        for item in report.diagnostics
+    )

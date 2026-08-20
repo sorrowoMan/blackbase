@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
@@ -68,6 +69,40 @@ def _protocol_header(type_name: str) -> dict[str, Any]:
         _PROTOCOL_TYPE_FIELD: f"blackbase.{str(type_name)}",
         _SCHEMA_VERSION_FIELD: SHARED_TYPE_SCHEMA_VERSION,
     }
+
+
+def _readonly_array(value: Any, *, dtype: Any = float) -> np.ndarray:
+    """Return an array whose public view cannot be made writeable again."""
+
+    owner = np.array(value, dtype=dtype, copy=True)
+    if owner.dtype.hasobject:
+        # Object arrays cannot use an immutable byte backing safely.  Detach
+        # them and expose a non-owning readonly view; wire codecs reject
+        # arbitrary objects before transport.
+        owner.setflags(write=False)
+        view = owner.view()
+        view.setflags(write=False)
+        return view
+    immutable = np.frombuffer(owner.tobytes(order="C"), dtype=owner.dtype)
+    immutable = immutable.reshape(owner.shape)
+    immutable.setflags(write=False)
+    return immutable
+
+
+def _freeze_shared_value(value: Any) -> Any:
+    """Detach nested protocol data and expose it through immutable containers."""
+
+    if isinstance(value, np.ndarray):
+        return _readonly_array(value, dtype=value.dtype)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_shared_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_shared_value(item) for item in value)
+    return value
 
 
 def _validate_protocol_header(payload: Mapping[str, Any], type_name: str) -> None:
@@ -234,37 +269,43 @@ class Feedback:
     constraints: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
     gradients: Optional[np.ndarray] = None
     loss: Optional[float] = None
-    metrics: dict[str, Any] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=dict)
     residuals: Optional[np.ndarray] = None
-    signals: dict[str, Any] = field(default_factory=dict)
-    info: dict[str, Any] = field(default_factory=dict)
+    signals: Mapping[str, Any] = field(default_factory=dict)
+    info: Mapping[str, Any] = field(default_factory=dict)
     gradient_ref: StateRef | DataRef | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "objectives", np.asarray(self.objectives, dtype=float))
-        object.__setattr__(self, "constraints", np.asarray(self.constraints, dtype=float))
+        object.__setattr__(self, "objectives", _readonly_array(self.objectives))
+        object.__setattr__(self, "constraints", _readonly_array(self.constraints))
         if self.gradients is not None:
-            object.__setattr__(self, "gradients", np.asarray(self.gradients, dtype=float))
+            object.__setattr__(self, "gradients", _readonly_array(self.gradients))
         if self.gradient_ref is not None and not isinstance(
             self.gradient_ref,
             (StateRef, DataRef),
         ):
             raise TypeError("Feedback.gradient_ref must be a StateRef, DataRef, or None")
         if self.residuals is not None:
-            object.__setattr__(self, "residuals", np.asarray(self.residuals, dtype=float))
-        object.__setattr__(self, "metrics", dict(self.metrics or {}))
-        object.__setattr__(self, "signals", dict(self.signals or {}))
-        object.__setattr__(self, "info", dict(self.info or {}))
+            object.__setattr__(self, "residuals", _readonly_array(self.residuals))
+        object.__setattr__(
+            self,
+            "metrics",
+            _freeze_shared_value(dict(self.metrics or {})),
+        )
+        object.__setattr__(
+            self,
+            "signals",
+            _freeze_shared_value(dict(self.signals or {})),
+        )
+        object.__setattr__(
+            self,
+            "info",
+            _freeze_shared_value(dict(self.info or {})),
+        )
 
     @property
     def ok(self) -> bool:
         return self.objectives is not None and self.objectives.size > 0
-
-    def scalar_score(self, constraint_penalty: float = 1e6) -> float:
-        obj = float(np.mean(self.objectives)) if self.objectives.size > 0 else 0.0
-        if self.constraints is not None and self.constraints.size > 0:
-            obj += float(constraint_penalty) * float(np.sum(np.maximum(0.0, self.constraints)))
-        return obj
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -313,11 +354,21 @@ class UnknownState:
     """Numeric candidate state with one canonical metadata field."""
 
     values: np.ndarray
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", np.asarray(self.values, dtype=float))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        canonical_metadata = _decode_shared_value(
+            _encode_shared_value(
+                dict(self.metadata or {}),
+                path="unknown_state.metadata",
+            )
+        )
+        object.__setattr__(self, "values", _readonly_array(self.values))
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_shared_value(dict(canonical_metadata or {})),
+        )
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -328,7 +379,7 @@ class UnknownState:
         return int(self.values.size)
 
     def as_array(self) -> np.ndarray:
-        return np.asarray(self.values, dtype=float)
+        return np.array(self.values, dtype=float, copy=True)
 
     def with_values(self, values: Any, **metadata: Any) -> "UnknownState":
         current_metadata = dict(self.metadata)
@@ -345,7 +396,10 @@ class UnknownState:
         return {
             "version": 1,
             "values": self.as_array(),
-            "metadata": dict(self.metadata),
+            "metadata": _encode_shared_value(
+                self.metadata,
+                path="unknown_state.metadata",
+            ),
         }
 
     @classmethod
@@ -355,11 +409,17 @@ class UnknownState:
             raise ValueError(f"unsupported UnknownState protocol version: {version}")
         return cls(
             values=np.asarray(payload.get("values", []), dtype=float),
-            metadata=dict(payload.get("metadata", {}) or {}),
+            metadata=dict(_decode_shared_value(payload.get("metadata", {})) or {}),
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {"values": self.as_array().tolist(), "metadata": dict(self.metadata)}
+        return {
+            "values": self.as_array().tolist(),
+            "metadata": _encode_shared_value(
+                self.metadata,
+                path="unknown_state.metadata",
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -429,8 +489,7 @@ class CandidateBatch:
         normalized_tokens = tuple(
             None if token is None else str(token).strip() or None for token in tokens
         )
-        matrix_copy = matrix.copy()
-        matrix_copy.setflags(write=False)
+        matrix_copy = _readonly_array(matrix)
         object.__setattr__(self, "semantic_states", tuple(detached_states))
         object.__setattr__(self, "numeric_matrix", matrix_copy)
         object.__setattr__(self, "candidate_tokens", normalized_tokens)
@@ -478,10 +537,7 @@ class CandidateBatch:
     def from_dict(cls, payload: Mapping[str, Any]) -> "CandidateBatch":
         _validate_protocol_header(payload, "candidate_batch")
         states = tuple(
-            UnknownState(
-                values=np.asarray(dict(item).get("values", ()), dtype=float),
-                metadata=dict(dict(item).get("metadata", {}) or {}),
-            )
+            UnknownState.from_protocol_payload(dict(item))
             for item in tuple(payload.get("semantic_states", ()) or ())
         )
         return cls(

@@ -9,6 +9,7 @@ from blackbase.resources import DataRef
 
 from .execution import CaseRunRequest, ProjectConfigurationError
 from .case_binding import case_resource_binding_audit
+from .check_output import build_case_check_payload
 
 
 def execute_case_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -101,6 +102,7 @@ def collect_artifact_refs(output: Mapping[str, Any]) -> dict[str, DataRef]:
 
 
 def case_runtime_state(case_obj: Any) -> dict[str, Any]:
+    check_payload = build_case_check_payload(case_obj)
     plugins = getattr(getattr(case_obj, "plugin_manager", None), "plugins", []) or []
     providers = getattr(getattr(case_obj, "evaluation_mediator", None), "list_providers", None)
     pipeline = (
@@ -112,9 +114,16 @@ def case_runtime_state(case_obj: Any) -> dict[str, Any]:
         "case_class": type(case_obj).__name__,
         "problem": type(getattr(case_obj, "problem", None)).__name__,
         "pipeline": type(pipeline).__name__,
+        "pipeline_variant": str(check_payload.get("pipeline_variant", "None")),
+        "initializer": str(check_payload.get("initializer", "None")),
+        "mutator": str(check_payload.get("mutator", "None")),
+        "repair": str(check_payload.get("repair", "None")),
         "adapter": type(getattr(case_obj, "adapter", None)).__name__,
         "providers": len(tuple(providers())) if callable(providers) else 0,
+        "provider_names": list(check_payload.get("providers", ()) or ()),
+        "provider_details": list(check_payload.get("provider_details", ()) or ()),
         "plugins": len(tuple(plugins)),
+        "plugin_names": list(check_payload.get("plugins", ()) or ()),
         "resource_context": _as_dict(getattr(case_obj, "resource_context", None)),
         "resource_binding": case_resource_binding_audit(case_obj),
         "component_overrides": _as_dict(

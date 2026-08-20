@@ -6,15 +6,15 @@ BlackBase 0.3 是一次有意的边界收口，不再提供旧仓库路径的转
 
 - `blackbase==0.3.x`：Project / Case / Scaffold、L0 资源、Context / Snapshot、公共调用绑定、Pipeline 编排、Catalog 与运行协议。
 - `nsgablack==0.3.x`：Solver、搜索 Adapter、Representation、Pareto、目标与约束等优化语义。
-- `mlblack==0.3.x`：Trainer、DataView、Codec、Head、Problem、Provider、Artifact 等 ML 语义。
+- `mlblack==0.4.x`：LearningSolver facade、DataView、Codec、Head、Problem、Provider、Artifact 等 ML 语义。
 
 下游依赖应声明：
 
 ```toml
-blackbase = ">=0.3.3,<0.4.0"
+blackbase = ">=0.3.6,<0.4.0"
 ```
 
-0.3.3 增加 CandidateBatch 语义/数值双视图、StateRef trajectory 与正式 StateRelease；0.3.2 增加 Problem Evaluation Provider 的正式状态协议：`StateRef` 只表示
+0.3.6 固化 canonical Case 的无兼容层规则，Doctor 会拒绝私有 run/fit wrapper 与兼容装配源码；0.3.5 固化 Feedback 的递归不可变边界，删除共享层默认标量化，给 state transition 增加 operand/slot state-kind 契约，并要求 build-check 关闭已构建 Case；0.3.4 固化 UnknownState/CandidateBatch 的不可变语义身份；0.3.3 增加 CandidateBatch 语义/数值双视图、StateRef trajectory 与正式 StateRelease；0.3.2 增加 Problem Evaluation Provider 的正式状态协议：`StateRef` 只表示
 Provider 进程内活状态；Adapter 通过版本栅栏 `StateTransitionRequest` 选择更新机制，
 再通过 `StateMaterializationRequest` 导出 `UnknownState` 或 `DataRef`。旧进程活引用
 不能作为 checkpoint 或 Artifact 恢复。

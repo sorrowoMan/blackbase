@@ -93,6 +93,10 @@ class StateTransitionMethodSpec:
     required_slots: tuple[str, ...] = ()
     optional_slots: tuple[str, ...] = ()
     result_slots: tuple[str, ...] = ()
+    operand_state_kinds: Mapping[str, Sequence[str] | str] = field(default_factory=dict)
+    inline_operands: tuple[str, ...] = ()
+    slot_state_kinds: Mapping[str, Sequence[str] | str] = field(default_factory=dict)
+    result_slot_state_kinds: Mapping[str, Sequence[str] | str] = field(default_factory=dict)
     allow_additional_operands: bool = False
     allow_additional_parameters: bool = False
     allow_additional_slots: bool = False
@@ -138,9 +142,69 @@ class StateTransitionMethodSpec:
                 raise ValueError(
                     f"{required_name} and {optional_name} overlap: {sorted(overlap)}"
                 )
+        declared_operands = set(normalized_fields["required_operands"]).union(
+            normalized_fields["optional_operands"]
+        )
+        declared_slots = set(normalized_fields["required_slots"]).union(
+            normalized_fields["optional_slots"]
+        )
+        declared_result_slots = set(normalized_fields["result_slots"])
+        operand_state_kinds = _normalized_state_kind_map(
+            self.operand_state_kinds,
+            field_name="operand_state_kinds",
+        )
+        slot_state_kinds = _normalized_state_kind_map(
+            self.slot_state_kinds,
+            field_name="slot_state_kinds",
+        )
+        result_slot_state_kinds = _normalized_state_kind_map(
+            self.result_slot_state_kinds,
+            field_name="result_slot_state_kinds",
+        )
+        inline_operands = _normalized_names(self.inline_operands)
+        for field_name, actual, declared, allow_additional in (
+            (
+                "operand_state_kinds",
+                set(operand_state_kinds),
+                declared_operands,
+                bool(self.allow_additional_operands),
+            ),
+            (
+                "inline_operands",
+                set(inline_operands),
+                declared_operands,
+                bool(self.allow_additional_operands),
+            ),
+            (
+                "slot_state_kinds",
+                set(slot_state_kinds),
+                declared_slots,
+                bool(self.allow_additional_slots),
+            ),
+            (
+                "result_slot_state_kinds",
+                set(result_slot_state_kinds),
+                declared_result_slots,
+                False,
+            ),
+        ):
+            unknown = actual.difference(declared)
+            if unknown and not allow_additional:
+                raise ValueError(
+                    f"StateTransitionMethodSpec.{field_name} names undeclared fields: "
+                    f"{sorted(unknown)}"
+                )
         object.__setattr__(self, "method_id", method_id)
         for field_name, value in normalized_fields.items():
             object.__setattr__(self, field_name, value)
+        object.__setattr__(self, "operand_state_kinds", operand_state_kinds)
+        object.__setattr__(self, "inline_operands", inline_operands)
+        object.__setattr__(self, "slot_state_kinds", slot_state_kinds)
+        object.__setattr__(
+            self,
+            "result_slot_state_kinds",
+            result_slot_state_kinds,
+        )
         object.__setattr__(
             self,
             "allow_additional_operands",
@@ -168,6 +232,17 @@ class StateTransitionMethodSpec:
             "required_slots": list(self.required_slots),
             "optional_slots": list(self.optional_slots),
             "result_slots": list(self.result_slots),
+            "operand_state_kinds": {
+                key: list(value) for key, value in self.operand_state_kinds.items()
+            },
+            "inline_operands": list(self.inline_operands),
+            "slot_state_kinds": {
+                key: list(value) for key, value in self.slot_state_kinds.items()
+            },
+            "result_slot_state_kinds": {
+                key: list(value)
+                for key, value in self.result_slot_state_kinds.items()
+            },
             "allow_additional_operands": self.allow_additional_operands,
             "allow_additional_parameters": self.allow_additional_parameters,
             "allow_additional_slots": self.allow_additional_slots,
@@ -200,6 +275,14 @@ class StateTransitionMethodSpec:
                 required_slots=tuple(value.get("required_slots", ()) or ()),
                 optional_slots=tuple(value.get("optional_slots", ()) or ()),
                 result_slots=tuple(value.get("result_slots", ()) or ()),
+                operand_state_kinds=dict(
+                    value.get("operand_state_kinds", {}) or {}
+                ),
+                inline_operands=tuple(value.get("inline_operands", ()) or ()),
+                slot_state_kinds=dict(value.get("slot_state_kinds", {}) or {}),
+                result_slot_state_kinds=dict(
+                    value.get("result_slot_state_kinds", {}) or {}
+                ),
                 allow_additional_operands=bool(
                     value.get("allow_additional_operands", False)
                 ),
@@ -768,6 +851,42 @@ def _validate_payload(payload: Mapping[str, Any], type_name: str) -> dict[str, A
 
 def _normalized_names(values: Sequence[Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value).strip().lower() for value in values if str(value).strip()))
+
+
+def _normalized_state_kind_map(
+    values: Mapping[str, Sequence[str] | str] | None,
+    *,
+    field_name: str,
+) -> Mapping[str, tuple[str, ...]]:
+    normalized: dict[str, tuple[str, ...]] = {}
+    for raw_name, raw_kinds in dict(values or {}).items():
+        name = str(raw_name or "").strip().lower()
+        if not name:
+            raise ValueError(f"StateTransitionMethodSpec.{field_name} has an empty key")
+        _validate_identifier_length(
+            name,
+            field_name=f"StateTransitionMethodSpec.{field_name}",
+        )
+        kinds = _normalized_names(
+            (raw_kinds,) if isinstance(raw_kinds, str) else tuple(raw_kinds or ())
+        )
+        if not kinds:
+            raise ValueError(
+                f"StateTransitionMethodSpec.{field_name}['{name}'] must declare "
+                "at least one state kind"
+            )
+        for kind in kinds:
+            _validate_identifier_length(
+                kind,
+                field_name=f"StateTransitionMethodSpec.{field_name}['{name}']",
+            )
+        normalized[name] = kinds
+    if len(normalized) > EVALUATION_DECLARATION_MAX_ITEMS:
+        raise ValueError(
+            f"StateTransitionMethodSpec.{field_name} exceeds "
+            f"{EVALUATION_DECLARATION_MAX_ITEMS} items"
+        )
+    return MappingProxyType(normalized)
 
 
 def _duplicates(values: Sequence[str] | Any) -> set[str]:

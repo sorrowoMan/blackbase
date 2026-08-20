@@ -130,7 +130,17 @@ def _check_project_root(project_root: Path, diags: list[DoctorDiagnostic], *, st
 
     case_count = 0
     if cases_dir.is_dir():
-        for case_root in sorted(item for item in cases_dir.iterdir() if item.is_dir() and item.name != "__pycache__"):
+        for case_root in sorted(
+            item
+            for item in cases_dir.iterdir()
+            if item.is_dir()
+            and item.name != "__pycache__"
+            and (
+                (item / ".case").is_file()
+                or (item / "build_solver.py").is_file()
+                or (item / "run_solver.py").is_file()
+            )
+        ):
             case_count += 1
             _check_case_root(case_root, diags, strict=strict)
     diags.append(
@@ -146,8 +156,9 @@ def _check_project_root(project_root: Path, diags: list[DoctorDiagnostic], *, st
 def _check_project_config(path: Path, diags: list[DoctorDiagnostic]) -> None:
     if not path.is_file():
         return
+    source = path.read_text(encoding="utf-8-sig", errors="replace")
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        tree = ast.parse(source)
     except SyntaxError as exc:
         diags.append(
             DoctorDiagnostic(
@@ -215,6 +226,26 @@ def _check_project_config(path: Path, diags: list[DoctorDiagnostic]) -> None:
             )
             continue
         case_names = tuple(str(item) for item in cases)
+        for case_name in case_names:
+            case_root = path.parent / "cases" / case_name
+            if not case_root.is_dir():
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-stage-case-missing",
+                        f"Stage '{stage_name}' references missing Case '{case_name}'.",
+                        str(case_root),
+                    )
+                )
+            elif not (case_root / ".case").is_file():
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-stage-case-marker-missing",
+                        f"Stage '{stage_name}' Case '{case_name}' is missing .case.",
+                        str(case_root / ".case"),
+                    )
+                )
         if len(case_names) != len(set(case_names)):
             diags.append(
                 DoctorDiagnostic(
@@ -616,6 +647,16 @@ def _check_case_root(case_root: Path, diags: list[DoctorDiagnostic], *, strict: 
     marker = case_root / ".case"
     _require_file(marker, diags)
     kind = _read_case_kind(marker)
+    if _case_marker_declares_key(marker, "compatibility"):
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "case-compatibility-marker-forbidden",
+                "Case markers may not opt out of the canonical build contract; "
+                "remove compatibility and migrate the Case.",
+                str(marker),
+            )
+        )
     if kind not in {"solver", "trainer"}:
         diags.append(
             DoctorDiagnostic(
@@ -664,12 +705,18 @@ def _check_case_root(case_root: Path, diags: list[DoctorDiagnostic], *, strict: 
     )
 
 
-def _check_build_signature(path: Path, *, diags: list[DoctorDiagnostic], strict: bool) -> None:
+def _check_build_signature(
+    path: Path,
+    *,
+    diags: list[DoctorDiagnostic],
+    strict: bool,
+) -> None:
     if not path.is_file():
         return
     func_name = "build_solver"
+    source = path.read_text(encoding="utf-8-sig", errors="replace")
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        tree = ast.parse(source)
     except SyntaxError as exc:
         diags.append(DoctorDiagnostic("error", "case-build-syntax", f"{path.name} has syntax error: {exc}", str(path)))
         return
@@ -681,6 +728,63 @@ def _check_build_signature(path: Path, *, diags: list[DoctorDiagnostic], strict:
     if target is None:
         diags.append(DoctorDiagnostic("error", "case-build-missing-function", f"{path.name} must define {func_name}().", str(path)))
         return
+    migrated_wrapper = any(
+        (
+            isinstance(node, ast.Name)
+            and node.id in {"MigratedExampleRunner", "runpy"}
+        )
+        or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "runpy"
+        )
+        for node in ast.walk(tree)
+    )
+    if migrated_wrapper:
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-migrated-wrapper-forbidden",
+                "A canonical Case may not delegate execution through runpy or a "
+                "MigratedExampleRunner; build a real Solver/Trainer instead.",
+                str(path),
+            )
+        )
+    source_lower = source.lower()
+    if "backward compatible" in source_lower or "compatibility assembly" in source_lower:
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-compatibility-source-forbidden",
+                "Canonical build_solver.py may not preserve a compatibility assembly; "
+                "migrate or remove the old Case.",
+                str(path),
+            )
+        )
+    wrapper_classes = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        method_names = {
+            item.name for item in node.body if isinstance(item, ast.FunctionDef)
+        }
+        if not method_names.intersection({"run", "fit"}):
+            continue
+        base_names = {_ast_qualified_name(base).split(".")[-1] for base in node.bases}
+        if any(name.endswith(("Solver", "Trainer")) for name in base_names):
+            continue
+        if node.name.endswith("Runner") or node.name.endswith("OuterCase"):
+            wrapper_classes.append(node.name)
+    if wrapper_classes:
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-private-control-wrapper-forbidden",
+                "Canonical build_solver.py defines a private run/fit wrapper instead of "
+                f"a Solver/Trainer control plane: {sorted(wrapper_classes)}.",
+                str(path),
+            )
+        )
     arg_names = [arg.arg for arg in (*target.args.args, *target.args.kwonlyargs)]
     for name in ("resource_context", "component_overrides"):
         if name not in arg_names:
@@ -718,6 +822,31 @@ def _check_build_signature(path: Path, *, diags: list[DoctorDiagnostic], strict:
                 )
             )
             break
+
+
+def _case_marker_declares_key(path: Path, key: str) -> bool:
+    if not path.is_file():
+        return False
+    expected = str(key or "").strip().lower()
+    for raw_line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip().lower() != expected:
+            continue
+        del value
+        return True
+    return False
+
+
+def _ast_qualified_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _ast_qualified_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
 
 
 def _iter_function_returns(function: ast.FunctionDef) -> Iterable[ast.Return]:

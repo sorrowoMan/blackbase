@@ -814,6 +814,27 @@ def run_case(case_obj: Any, *, case_kind: str = "solver"):
     return case_obj
 
 
+def close_case_after_build_check(case_obj: Any) -> dict[str, Any]:
+    """Release resources acquired while validating a built Case.
+
+    A build check does not enter the normal Solver/Trainer lifecycle, so its
+    object cannot rely on ``run()``/``fit()`` to reach teardown.  The first
+    inspectable zero-argument close hook is executed exactly once.
+    """
+
+    for name in ("close_after_build_check", "close", "teardown"):
+        hook = getattr(case_obj, name, None)
+        if not callable(hook):
+            continue
+        try:
+            inspect.signature(hook).bind()
+        except (TypeError, ValueError):
+            continue
+        hook()
+        return {"status": "closed", "hook": name}
+    return {"status": "unavailable", "hook": None}
+
+
 def iter_group_stages(config_module: Any, group_name: str) -> Sequence[Mapping[str, Any]]:
     groups = getattr(config_module, "GROUPS", {}) or {}
     stages = getattr(config_module, "STAGES", []) or []

@@ -149,9 +149,19 @@ def test_shared_protocol_types() -> None:
     assert moved.metadata == {"source": "test", "stage": "mutate"}
     assert moved.as_array().tolist() == [3.0, 4.0]
 
-    feedback = Feedback(objectives=[1.0], constraints=[0.0])
+    source_objectives = np.asarray([1.0], dtype=float)
+    feedback = Feedback(
+        objectives=source_objectives,
+        constraints=[0.0],
+        metrics={"nested": {"count": 1}},
+    )
     assert feedback.ok
-    assert feedback.scalar_score() == 1.0
+    source_objectives[0] = 9.0
+    assert feedback.objectives.tolist() == [1.0]
+    with pytest.raises(ValueError):
+        feedback.objectives.setflags(write=True)
+    with pytest.raises(TypeError):
+        feedback.metrics["nested"]["count"] = 2
 
 
 def test_context_and_snapshot_store() -> None:
@@ -317,6 +327,69 @@ def test_case_import_context_restores_short_name_modules(tmp_path) -> None:
             if name == "pipeline" or name.startswith("pipeline."):
                 sys.modules.pop(name, None)
         sys.modules.update(previous)
+
+
+def test_cli_case_build_check_uses_canonical_builder_without_running_cli(tmp_path) -> None:
+    project_root = create_project(tmp_path / "cli_build_check", framework="blackbase")
+    case_root = add_case("fit_case", "trainer", project_root=project_root)
+    cli_marker = project_root / "cli-ran.txt"
+    close_marker = project_root / "build-check-closed.txt"
+    (case_root / "build_solver.py").write_text(
+        f"""
+from pathlib import Path
+
+
+class Case:
+    def __init__(self, resource_context=None):
+        self.resource_context = resource_context
+
+    def set_resource_context(self, resource_context):
+        self.resource_context = resource_context
+        return self
+
+    def fit(self):
+        raise AssertionError("build-check must not execute the Case")
+
+    def close(self):
+        Path({str(close_marker)!r}).write_text("closed", encoding="utf-8")
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, component_overrides
+    return Case(resource_context)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (case_root / "run_solver.py").write_text(
+        f"from pathlib import Path\nPath({str(cli_marker)!r}).write_text('ran', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (project_root / "project_config.py").write_text(
+        """
+PROJECT_NAME = "cli_build_check"
+STAGES = [{
+    "name": "main",
+    "cases": ["fit_case"],
+    "case_modes": {"fit_case": "cli"},
+}]
+GROUPS = {"default": {"stages": ["main"]}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = execute_project(project_root, check=True, build_check=True, record=False)
+
+    assert result.ok
+    assert result.case_results[0].status == "built"
+    assert result.case_results[0].request.mode == "build"
+    assert result.case_results[0].request.metadata["configured_mode"] == "cli"
+    assert result.case_results[0].metadata["build_check_cleanup"] == {
+        "status": "closed",
+        "hook": "close",
+    }
+    assert result.case_results[0].metadata["runtime_state"]["case_class"] == "Case"
+    assert close_marker.read_text(encoding="utf-8") == "closed"
+    assert not cli_marker.exists()
 
 
 def test_execute_project_returns_results_and_passes_artifact_refs_and_overrides(tmp_path) -> None:
