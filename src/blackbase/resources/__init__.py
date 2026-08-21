@@ -38,6 +38,7 @@ from .pool import (
     PoolTask,
     PoolResult,
 )
+from .grant_pool import ResourceGrantPool, ResourceSubgrant, ResourceSubgrantError
 from .transport import (
     ClaimedTask,
     InMemoryTaskTransport,
@@ -126,6 +127,9 @@ __all__ = [
     "PoolScheduler",
     "PoolTask",
     "PoolResult",
+    "ResourceGrantPool",
+    "ResourceSubgrant",
+    "ResourceSubgrantError",
     # transport
     "ClaimedTask",
     "InMemoryTaskTransport",

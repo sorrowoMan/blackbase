@@ -276,6 +276,16 @@ class BoundStateMaterializationProvider:
                 "state materialization binding changed after provider selection"
             )
         result = self.provider.materialize(request, self.binding)
+        if self.binding.request_digest and (
+            _protocol_digest(request.as_dict()) != self.binding.request_digest
+        ):
+            raise EvaluationProviderContractError(
+                "provider mutated the bound state materialization request"
+            )
+        if _protocol_digest(self.binding.as_dict()) != self.binding_digest:
+            raise EvaluationProviderContractError(
+                "provider mutated the authoritative materialization binding"
+            )
         if not isinstance(result, StateMaterializationResult):
             raise EvaluationProviderContractError(
                 f"provider '{self.binding.provider_id}' returned "
@@ -326,6 +336,16 @@ class BoundStateReleaseProvider:
                 "bound release provider cannot execute a changed request"
             )
         result = self.provider.release(request, self.binding)
+        if self.binding.request_digest and (
+            _protocol_digest(request.as_dict()) != self.binding.request_digest
+        ):
+            raise EvaluationProviderContractError(
+                "provider mutated the bound state release request"
+            )
+        if _protocol_digest(self.binding.as_dict()) != self.binding_digest:
+            raise EvaluationProviderContractError(
+                "provider mutated the authoritative release binding"
+            )
         if not isinstance(result, StateReleaseResult):
             raise EvaluationProviderContractError(
                 f"provider '{self.binding.provider_id}' returned "
@@ -825,7 +845,9 @@ def _try_release_binding(
     resource_error = _resource_mismatch(spec.resource_requirement, context)
     if resource_error:
         return resource_error
-    if request.scope_id and context.namespace and request.scope_id != context.namespace:
+    if not context.namespace:
+        return "state release requires a non-empty authoritative L0 namespace"
+    if request.scope_id != context.namespace:
         return (
             f"release scope '{request.scope_id}' conflicts with L0 namespace "
             f"'{context.namespace}'"
@@ -1129,16 +1151,33 @@ def _select_device(
 ) -> str | None:
     grant = dict(context.grant or {})
     available: list[str] = []
+    device_tokens = tuple(
+        str(value) for value in grant.get("device_tokens", ()) or ()
+    )
     current = str(context.device or "cpu").strip().lower()
-    if current not in {"", "auto", "none"}:
+    current_is_unresolved_token = (
+        current in {value.strip().lower() for value in device_tokens}
+        and not _is_physical_device_name(current)
+    )
+    if current not in {"", "auto", "none"} and not current_is_unresolved_token:
         available.append(current)
     available.extend(
-        str(value).strip().lower()
-        for value in grant.get("device_tokens", ()) or ()
-        if str(value).strip()
+        _normalize_physical_device_name(value)
+        for value in device_tokens
+        if _is_physical_device_name(value)
     )
-    if int(grant.get("gpus", 0) or 0) > 0 and not any(
+    resolved_devices = dict(grant.get("resolved_devices", {}) or {})
+    available.extend(
+        str(resolved_devices[token]).strip().lower()
+        for token in device_tokens
+        if token in resolved_devices and str(resolved_devices[token]).strip()
+    )
+    if (
+        int(grant.get("gpus", 0) or 0) > 0
+        and not device_tokens
+        and not any(
         _device_family(value) in {"gpu", "mps"} for value in available
+        )
     ):
         available.append("gpu")
     # A CPU grant remains available for orchestration even when an accelerator
@@ -1161,6 +1200,23 @@ def _select_device(
         if selected is not None:
             return selected
     return None
+
+
+def _is_physical_device_name(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return (
+        normalized == "gpu"
+        or normalized.startswith(("cuda:", "gpu:"))
+        or normalized == "mps"
+        or normalized.startswith("mps:")
+    )
+
+
+def _normalize_physical_device_name(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized.startswith("gpu:"):
+        return "cuda:" + normalized.split(":", 1)[1]
+    return normalized
 
 
 def _matching_device(requested: str, available: list[str]) -> str | None:

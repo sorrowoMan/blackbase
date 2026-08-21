@@ -97,8 +97,7 @@ def run(self):
             inputs={"dataset_ref": "artifact://prepared/train"},
         )
     )
-    if not child.ok:
-        raise RuntimeError(child.error)
+    child.raise_for_failure("surrogate fitting failed")
     return {"child_result": child.as_dict()}
 ```
 
@@ -142,8 +141,8 @@ artifact authority.
 
 ## 共享协议版本
 
-当前三仓共享底座基线为 `blackbase 0.3.6`。`nsgablack` 与 `mlblack`
-必须声明 `blackbase>=0.3.6,<0.4.0`；该下限包含 canonical Case 无兼容层 Doctor、递归不可变 Feedback、具备 operand/slot state-kind 契约的 transition method、build-check 资源清理，以及不可变 CandidateBatch 双视图、StateRelease、trajectory lineage 和正式 Evaluation Provider、
+当前三仓共享底座基线为 `blackbase 0.3.8`。`nsgablack` 与 `mlblack`
+必须声明 `blackbase>=0.3.8,<0.4.0`；该下限进一步包含递归不可变 Case/L0 协议、父 grant 并发分账、逻辑设备 token 解析、严格 StateRelease scope 和有界 TrainerResult Artifact 边界；同时保留 canonical Case 无兼容层 Doctor、不可变 CandidateBatch 双视图、trajectory lineage 和正式 Evaluation Provider、
 StateRef transition 与 materialization 协议。
 
 `Feedback` 只承载语义证据，不提供默认 objective scalarization。需要把多目标
@@ -157,6 +156,9 @@ Feedback 投影为单值时，调用方必须显式装配 projector/scalarizer�
 来源均进入有界正式信封。具体破坏性变更见 [MIGRATION.md](MIGRATION.md)。
 
 包版本、共享类型 wire schema 与 Context schema 分别演进，不能互相代替。
+
+三仓冻结与发布必须遵守 [STACK_RELEASE.md](STACK_RELEASE.md) 中的依赖顺序，
+下游包不得先于其最低版本依赖发布。
 
 ## 安装
 

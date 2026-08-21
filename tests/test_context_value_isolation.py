@@ -24,10 +24,12 @@ def test_detach_context_value_rebuilds_data_ref_metadata() -> None:
     ref = DataRef(uri="artifact://model", metadata={"nested": {"values": [1]}})
 
     detached = detach_context_value(ref)
-    detached.metadata["nested"]["values"].append(2)
+    detached_payload = detached.as_dict()
+    detached_payload["metadata"]["nested"]["values"].append(2)
 
     assert detached is not ref
-    assert ref.metadata == {"nested": {"values": [1]}}
+    assert ref.as_dict()["metadata"] == {"nested": {"values": [1]}}
+    assert detached.as_dict()["metadata"] == {"nested": {"values": [1]}}
 
 
 def test_detach_context_value_rebuilds_immutable_state_ref() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -178,13 +179,12 @@ def test_sqlite_transport_submit_is_idempotent_and_json_strict(tmp_path) -> None
     with pytest.raises(TaskTransportError, match="different envelope"):
         transport.submit(changed)
 
-    unsafe = TaskEnvelope(
-        task_id="unsafe",
-        task_type="project_case",
-        payload={"value": object()},
-    )
-    with pytest.raises(TypeError, match="JSON serializable"):
-        transport.submit(unsafe)
+    with pytest.raises(TypeError, match="not wire-safe"):
+        TaskEnvelope(
+            task_id="unsafe",
+            task_type="project_case",
+            payload={"value": object()},
+        )
 
 
 def test_sqlite_transport_claim_is_atomic_and_checks_worker_contract(tmp_path) -> None:
@@ -649,12 +649,15 @@ class Case:
         counter.write_text(str(count), encoding="utf-8")
         if count == 1:
             raise RuntimeError("retry me")
+        model_ref = self.case_runtime.publish_artifact(
+            "model",
+            {"count": count},
+            kind="model",
+        )
         return {
             "count": count,
             "lease_id": self.resource_context["lease"]["lease_id"],
-            "artifact_refs": {
-                "model": {"uri": "memory://external/model", "kind": "model"},
-            },
+            "artifact_refs": {"model": model_ref},
         }
 
 def build_solver(config=None, *, resource_context=None, component_overrides=None):
@@ -676,6 +679,14 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                 "scope": "remote",
                 "threads": 1,
                 "lease": {"lease_id": "project-l0-lease"},
+                "metadata": {
+                    "artifact_authority": {
+                        "backend": "filesystem",
+                        "root": str(project_root / ".blackbase" / "artifacts"),
+                        "namespace": "worker-project",
+                        "schema_version": 1,
+                    },
+                },
             },
         ).as_dict(),
         "extra_python_paths": [],
@@ -702,7 +713,7 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
     worker_payload = completed.result.output
     assert worker_payload["output"]["count"] == 2
     assert worker_payload["output"]["lease_id"] == "project-l0-lease"
-    assert worker_payload["artifact_refs"]["model"]["uri"] == "memory://external/model"
+    assert Path(worker_payload["artifact_refs"]["model"]["uri"]).is_file()
     assert completed.result.artifact_refs[0].kind == "model"
     assert (project_root / "remote_case.count").read_text(encoding="utf-8") == "2"
     assert transport.list_workers()[0].status == "idle"

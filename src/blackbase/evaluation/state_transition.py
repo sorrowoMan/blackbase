@@ -18,6 +18,7 @@ import numpy as np
 from blackbase.resources import DataRef
 from blackbase.state_ref import StateRef
 from blackbase.types import decode_shared_value, encode_shared_value
+from blackbase.wire import freeze_wire_mapping, thaw_wire_value
 
 from .model import (
     EVALUATION_DECLARATION_MAX_ITEMS,
@@ -101,7 +102,7 @@ class StateMaterializationRequest:
             "state_ref": self.state_ref.as_dict(),
             "target": self.target,
             "release_after": self.release_after,
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -206,7 +207,7 @@ class StateMaterializationResult:
             "target": self.target,
             "value": encoded_value,
             "binding": None if self.binding is None else self.binding.as_dict(),
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -259,9 +260,9 @@ class StateReleaseRequest:
             raise ValueError("StateReleaseRequest.provider_id must not be empty")
         if not request_id:
             raise ValueError("StateReleaseRequest.request_id must not be empty")
-        if not scope_id and not trajectory_id:
+        if not scope_id:
             raise ValueError(
-                "StateReleaseRequest requires scope_id or trajectory_id"
+                "StateReleaseRequest.scope_id is required for L0 namespace authorization"
             )
         kinds = tuple(
             dict.fromkeys(
@@ -292,7 +293,7 @@ class StateReleaseRequest:
             "scope_id": self.scope_id,
             "trajectory_id": self.trajectory_id,
             "state_kinds": list(self.state_kinds),
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -373,7 +374,7 @@ class StateReleaseResult:
             "released_count": self.released_count,
             "released_state_ids": list(self.released_state_ids),
             "binding": None if self.binding is None else self.binding.as_dict(),
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -509,9 +510,9 @@ class StateTransitionRequest:
             "slot_refs": {
                 key: value.as_dict() for key, value in self.slot_refs.items()
             },
-            "parameters": _thaw_wire(self.parameters),
+            "parameters": thaw_wire_value(self.parameters),
             "step_index": self.step_index,
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -623,9 +624,9 @@ class StateTransitionResult:
             "slot_refs": {
                 key: value.as_dict() for key, value in self.slot_refs.items()
             },
-            "metrics": _thaw_wire(self.metrics),
+            "metrics": thaw_wire_value(self.metrics),
             "binding": None if self.binding is None else self.binding.as_dict(),
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -726,25 +727,9 @@ def _freeze_wire_mapping(
     path: str,
 ) -> Mapping[str, Any]:
     encoded = encode_shared_value(dict(value or {}), path=path)
-    return _freeze_wire(encoded)
-
-
-def _freeze_wire(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze_wire(item) for key, item in value.items()}
-        )
-    if isinstance(value, list):
-        return tuple(_freeze_wire(item) for item in value)
-    return value
-
-
-def _thaw_wire(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _thaw_wire(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_wire(item) for item in value]
-    return value
+    if not isinstance(encoded, Mapping):
+        raise TypeError(f"encoded {path} must be a mapping")
+    return freeze_wire_mapping(encoded, path=path)
 
 
 def _validate_payload(payload: Mapping[str, Any], type_name: str) -> dict[str, Any]:

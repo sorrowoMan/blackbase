@@ -720,6 +720,58 @@ def _check_build_signature(
     except SyntaxError as exc:
         diags.append(DoctorDiagnostic("error", "case-build-syntax", f"{path.name} has syntax error: {exc}", str(path)))
         return
+    if any(_mutates_sys_path(node) for node in ast.walk(tree)):
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-build-mutates-sys-path",
+                "Canonical build_solver.py must use the shared Case import context and "
+                "package-relative imports; it may not modify sys.path.",
+                str(path),
+            )
+        )
+    if any(_is_main_guard(node) for node in tree.body):
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-build-executable-entry-forbidden",
+                "Canonical build_solver.py is assembly-only and may not expose an "
+                "executable __main__ entry; use run_solver.py for the Case CLI.",
+                str(path),
+            )
+        )
+    cli_functions = sorted(
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"main", "_build_parser", "build_parser"}
+    )
+    imports_argparse = any(
+        (
+            isinstance(node, ast.Import)
+            and any(alias.name == "argparse" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "argparse"
+        )
+        for node in tree.body
+    )
+    if cli_functions or imports_argparse:
+        details = []
+        if cli_functions:
+            details.append(f"functions={cli_functions}")
+        if imports_argparse:
+            details.append("imports=argparse")
+        diags.append(
+            DoctorDiagnostic(
+                "error" if strict else "warn",
+                "case-build-cli-surface-forbidden",
+                "Canonical build_solver.py is assembly-only; parser and CLI surfaces "
+                f"belong in run_solver.py ({', '.join(details)}).",
+                str(path),
+            )
+        )
     target = None
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == func_name:
@@ -822,6 +874,56 @@ def _check_build_signature(
                 )
             )
             break
+
+
+def _mutates_sys_path(node: ast.AST) -> bool:
+    if isinstance(node, ast.Call):
+        func = node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr in {"append", "clear", "extend", "insert", "pop", "remove", "reverse", "sort"}
+            and _is_sys_path_expression(func.value)
+        )
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.Delete):
+            targets = node.targets
+        else:
+            targets = (node.target,)
+        return any(_is_sys_path_target(target) for target in targets)
+    return False
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
+
+
+def _is_sys_path_expression(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "path"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "sys"
+    )
+
+
+def _is_sys_path_target(node: ast.AST) -> bool:
+    if _is_sys_path_expression(node):
+        return True
+    return isinstance(node, ast.Subscript) and _is_sys_path_expression(node.value)
 
 
 def _case_marker_declares_key(path: Path, key: str) -> bool:

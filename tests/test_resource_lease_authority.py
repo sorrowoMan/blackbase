@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -17,11 +18,36 @@ from blackbase.project.scaffold import add_case, create_project
 from blackbase.resources import (
     ResourceAllocator,
     ResourceBudgetError,
+    InMemoryLeaseStore,
+    ResourceLease,
     ResourceOffer,
     ResourcePolicy,
     ResourceRequest,
     SQLiteLeaseStore,
 )
+
+
+def test_resource_lease_is_recursively_immutable_and_store_safe() -> None:
+    lease = ResourceLease(
+        lease_id="lease-immutable",
+        resources={"threads": 2, "resolved_devices": {"gpu-a": "cuda:0"}},
+        metadata={"audit": {"source": "test"}},
+        fencing_token=3,
+    )
+    store = InMemoryLeaseStore()
+    store.create(lease)
+
+    observed = store.get(lease.lease_id)
+    assert observed is lease
+    with pytest.raises(FrozenInstanceError):
+        observed.fencing_token = 99
+    with pytest.raises(TypeError):
+        observed.resources["threads"] = 99
+    with pytest.raises(TypeError):
+        observed.resources["resolved_devices"]["gpu-a"] = "cuda:9"
+    with pytest.raises(TypeError):
+        observed.metadata["audit"]["source"] = "rewritten"
+    assert store.get(lease.lease_id).as_dict() == lease.as_dict()
 
 
 def _allocator(path, *, ttl_seconds: float = 30.0) -> ResourceAllocator:

@@ -20,6 +20,7 @@ from blackbase.types import (
     decode_shared_value,
     encode_shared_value,
 )
+from blackbase.wire import freeze_wire_mapping, thaw_wire_value
 
 
 EVALUATION_SCHEMA_VERSION = 1
@@ -57,7 +58,7 @@ class CapabilityRequirement:
         return {
             "name": self.name,
             "policy": self.policy,
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -246,7 +247,7 @@ class StateTransitionMethodSpec:
             "allow_additional_operands": self.allow_additional_operands,
             "allow_additional_parameters": self.allow_additional_parameters,
             "allow_additional_slots": self.allow_additional_slots,
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -497,7 +498,7 @@ class EvaluationProviderSpec:
             "transition_methods": [
                 item.as_dict() for item in self.transition_methods
             ],
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -598,8 +599,8 @@ class EvaluationRequest:
             "mode": self.mode,
             "states": [_encode_state(value) for value in self.states],
             "capabilities": [item.as_dict() for item in self.capabilities],
-            "payload": _thaw_wire(self.payload),
-            "metadata": _thaw_wire(self.metadata),
+            "payload": thaw_wire_value(self.payload),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -684,7 +685,7 @@ class EvaluationBinding:
                 self.missing_preferred_capabilities
             ),
             "degraded": self.degraded,
-            "audit": _thaw_wire(self.audit),
+            "audit": thaw_wire_value(self.audit),
         }
 
     @classmethod
@@ -772,7 +773,7 @@ class EvaluationResult:
                 for key, value in self.artifacts.items()
             },
             "binding": None if self.binding is None else self.binding.as_dict(),
-            "metadata": _thaw_wire(self.metadata),
+            "metadata": thaw_wire_value(self.metadata),
         }
 
     @classmethod
@@ -933,25 +934,9 @@ def _validate_identifier_length(value: str, *, field_name: str) -> None:
 
 def _freeze_wire_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     encoded = encode_shared_value(dict(value or {}), path="evaluation.metadata")
-    return _freeze_wire(encoded)
-
-
-def _freeze_wire(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze_wire(item) for key, item in value.items()}
-        )
-    if isinstance(value, list):
-        return tuple(_freeze_wire(item) for item in value)
-    return value
-
-
-def _thaw_wire(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _thaw_wire(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_wire(item) for item in value]
-    return value
+    if not isinstance(encoded, Mapping):
+        raise TypeError("encoded evaluation metadata must be a mapping")
+    return freeze_wire_mapping(encoded, path="evaluation.metadata")
 
 
 __all__ = [

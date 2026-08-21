@@ -620,8 +620,10 @@ class TrainerResult:
     report: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     best_model_ref: DataRef | None = None
+    best_state_ref: DataRef | None = None
     population_ref: DataRef | None = None
     history_ref: DataRef | None = None
+    report_ref: DataRef | None = None
     artifact_refs: Mapping[str, DataRef] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -631,8 +633,10 @@ class TrainerResult:
         object.__setattr__(self, "report", dict(self.report or {}))
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
         object.__setattr__(self, "best_model_ref", _coerce_data_ref(self.best_model_ref))
+        object.__setattr__(self, "best_state_ref", _coerce_data_ref(self.best_state_ref))
         object.__setattr__(self, "population_ref", _coerce_data_ref(self.population_ref))
         object.__setattr__(self, "history_ref", _coerce_data_ref(self.history_ref))
+        object.__setattr__(self, "report_ref", _coerce_data_ref(self.report_ref))
         artifact_refs: dict[str, DataRef] = {}
         for key, value in dict(self.artifact_refs or {}).items():
             ref = _coerce_data_ref(value)
@@ -654,9 +658,18 @@ class TrainerResult:
             "best_model_ref": (
                 None if self.best_model_ref is None else _encode_data_ref(self.best_model_ref)
             ),
-            "best_state": _encode_shared_value(
-                self.best_state,
-                path="trainer_result.best_state",
+            "best_state": (
+                None
+                if self.best_state_ref is not None
+                else _encode_shared_value(
+                    self.best_state,
+                    path="trainer_result.best_state",
+                )
+            ),
+            "best_state_ref": (
+                None
+                if self.best_state_ref is None
+                else _encode_data_ref(self.best_state_ref)
             ),
             "best_objectives": (
                 None if self.best_objectives is None else self.best_objectives.tolist()
@@ -684,7 +697,14 @@ class TrainerResult:
             "population_ref": (
                 None if self.population_ref is None else _encode_data_ref(self.population_ref)
             ),
-            "report": _encode_shared_value(self.report, path="trainer_result.report"),
+            "report": (
+                {}
+                if self.report_ref is not None
+                else _encode_shared_value(self.report, path="trainer_result.report")
+            ),
+            "report_ref": (
+                None if self.report_ref is None else _encode_data_ref(self.report_ref)
+            ),
             "metadata": _encode_shared_value(
                 self.metadata,
                 path="trainer_result.metadata",
@@ -718,8 +738,10 @@ class TrainerResult:
             report=dict(_decode_shared_value(data.get("report", {})) or {}),
             metadata=dict(_decode_shared_value(data.get("metadata", {})) or {}),
             best_model_ref=_decode_shared_value(data.get("best_model_ref")),
+            best_state_ref=_decode_shared_value(data.get("best_state_ref")),
             population_ref=_decode_shared_value(data.get("population_ref")),
             history_ref=_decode_shared_value(data.get("history_ref")),
+            report_ref=_decode_shared_value(data.get("report_ref")),
             artifact_refs={
                 str(key): _decode_shared_value(value)
                 for key, value in dict(data.get("artifact_refs", {}) or {}).items()

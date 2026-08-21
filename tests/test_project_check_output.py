@@ -9,6 +9,7 @@ from blackbase.project import (
     format_case_check,
     format_resource_context_summary,
     load_resource_context_from_env,
+    run_standard_case_cli,
 )
 from blackbase.project.doctor import run_common_project_doctor
 from blackbase.project.scaffold import add_case, create_project
@@ -166,6 +167,38 @@ def test_cli_case_loads_framework_resource_context_from_environment() -> None:
     assert payload == {"threads": 2, "namespace": "project.case"}
 
 
+def test_cli_resource_context_distinguishes_absent_and_explicit_empty_grant() -> None:
+    assert load_resource_context_from_env("blackbase", environ={}) is None
+    assert load_resource_context_from_env(
+        "blackbase",
+        environ={"BLACKBASE_RESOURCE_CONTEXT_JSON": "{}"},
+    ) == {}
+
+
+def test_standard_case_cli_treats_missing_environment_grant_as_standalone(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("search", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        "class Case:\n"
+        "    def __init__(self):\n"
+        "        self.resource_context = {'namespace': 'standalone.local'}\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    assert resource_context is None\n"
+        "    return Case()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("BLACKBASE_RESOURCE_CONTEXT_JSON", raising=False)
+
+    assert run_standard_case_cli(
+        case_root / "run_solver.py",
+        framework="blackbase",
+        argv=("--check",),
+    ) == 0
+
+
 def test_doctor_rejects_build_entry_returning_multiple_cases(tmp_path) -> None:
     project_root = create_project(tmp_path / "project")
     case_root = add_case("comparison", "trainer", project_root=project_root)
@@ -268,6 +301,71 @@ def test_doctor_rejects_compatibility_assembly_source(tmp_path) -> None:
 
     assert any(
         item.code == "case-compatibility-source-forbidden"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_canonical_builder_sys_path_mutation(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("legacy_imports", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        "import sys\n\n"
+        "sys.path.insert(0, '/tmp/private-case-path')\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return object()\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-build-mutates-sys-path"
+        and item.level == "error"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_executable_main_guard_in_canonical_builder(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("double_entry", "solver", project_root=project_root)
+    build_entry = case_root / "build_solver.py"
+    build_entry.write_text(
+        build_entry.read_text(encoding="utf-8")
+        + "\n\ndef main():\n"
+        + "    return 0\n\n"
+        + "if __name__ == '__main__':\n"
+        + "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-build-executable-entry-forbidden"
+        and item.level == "error"
+        for item in report.diagnostics
+    )
+
+
+def test_doctor_rejects_cli_surface_without_main_guard_in_canonical_builder(tmp_path) -> None:
+    project_root = create_project(tmp_path / "project")
+    case_root = add_case("hidden_double_entry", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        "import argparse\n\n"
+        "def build_solver(config=None, *, resource_context=None, component_overrides=None):\n"
+        "    return object()\n\n"
+        "def _build_parser():\n"
+        "    return argparse.ArgumentParser()\n\n"
+        "def main(argv=None):\n"
+        "    return _build_parser().parse_args(argv)\n",
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+
+    assert any(
+        item.code == "case-build-cli-surface-forbidden"
+        and item.level == "error"
         for item in report.diagnostics
     )
 

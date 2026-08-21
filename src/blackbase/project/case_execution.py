@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from blackbase.resources import DataRef
+from blackbase.types import encode_shared_value
 
 from .execution import CaseRunRequest, ProjectConfigurationError
 from .case_binding import case_resource_binding_audit
@@ -39,7 +40,7 @@ def make_transport_safe(value: Any, *, path: str) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, DataRef):
-        return value.as_dict()
+        return encode_shared_value(value, path=path)
     if isinstance(value, Mapping):
         return {
             str(key): make_transport_safe(item, path=f"{path}.{key}")
@@ -135,8 +136,6 @@ def case_runtime_state(case_obj: Any) -> dict[str, Any]:
 def _coerce_data_ref(value: Any) -> DataRef | None:
     if isinstance(value, DataRef):
         return value
-    if isinstance(value, (str, Path)):
-        return DataRef(uri=str(value))
     if not isinstance(value, Mapping):
         describe = getattr(value, "as_dict", None)
         if callable(describe):
@@ -144,8 +143,8 @@ def _coerce_data_ref(value: Any) -> DataRef | None:
     if not isinstance(value, Mapping):
         return None
     payload = dict(value)
-    if "uri" not in payload and payload.get("path"):
-        payload["uri"] = str(payload["path"])
+    if str(payload.get("protocol_type", "")) != "blackbase.data_ref":
+        return None
     if not payload.get("uri"):
         return None
     return DataRef.from_dict(payload)

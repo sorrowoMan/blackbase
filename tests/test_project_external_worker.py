@@ -57,12 +57,15 @@ class Case:
         self.resource_context = dict(resource_context or {})
 
     def run(self):
+        report_ref = self.case_runtime.publish_artifact(
+            "report",
+            {"pid": os.getpid()},
+            kind="report",
+        )
         return {
             "pid": os.getpid(),
             "lease_id": self.resource_context["lease"]["lease_id"],
-            "artifact_refs": {
-                "report": {"uri": "memory://external/report", "kind": "report"},
-            },
+            "artifact_refs": {"report": report_ref},
         }
 
 def build_solver(config=None, *, resource_context=None, component_overrides=None):
@@ -455,7 +458,10 @@ def test_project_resume_reconciles_submit_before_manifest_crash_window(tmp_path)
     assert result.ok
     assert result.case_results[0].status == "resumed"
     assert result.case_results[0].output["recovered"] is True
-    assert result.case_results[0].request.resource_context == old_resource_context
+    assert (
+        result.case_results[0].request.as_dict()["resource_context"]
+        == old_resource_context
+    )
     assert result.artifact_registry["external.external_case.report"].uri == "memory://recovered/report"
     assert transport.counts() == {"succeeded": 1}
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
@@ -692,6 +698,7 @@ def test_project_resume_replaces_task_whose_project_fence_is_stale(tmp_path) -> 
 
     def run_replacement_worker() -> None:
         time.sleep(0.3)
+        replacement_worker.run_once()
         replacement_worker.run_once()
 
     worker_thread = threading.Thread(target=run_replacement_worker, daemon=True)

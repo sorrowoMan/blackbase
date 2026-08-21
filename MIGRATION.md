@@ -11,10 +11,10 @@ BlackBase 0.3 是一次有意的边界收口，不再提供旧仓库路径的转
 下游依赖应声明：
 
 ```toml
-blackbase = ">=0.3.6,<0.4.0"
+blackbase = ">=0.3.8,<0.4.0"
 ```
 
-0.3.6 固化 canonical Case 的无兼容层规则，Doctor 会拒绝私有 run/fit wrapper 与兼容装配源码；0.3.5 固化 Feedback 的递归不可变边界，删除共享层默认标量化，给 state transition 增加 operand/slot state-kind 契约，并要求 build-check 关闭已构建 Case；0.3.4 固化 UnknownState/CandidateBatch 的不可变语义身份；0.3.3 增加 CandidateBatch 语义/数值双视图、StateRef trajectory 与正式 StateRelease；0.3.2 增加 Problem Evaluation Provider 的正式状态协议：`StateRef` 只表示
+0.3.8 增加递归不可变 Case/L0 wire contract、父 grant 并发分账、逻辑设备 token 到物理设备的权威解析、严格 StateRelease scope、TrainerResult 大字段 Artifact 引用，以及结构化嵌套 Case 失败传播；0.3.6 固化 canonical Case 的无兼容层规则，Doctor 会拒绝私有 run/fit wrapper 与兼容装配源码；0.3.5 固化 Feedback 的递归不可变边界，删除共享层默认标量化，给 state transition 增加 operand/slot state-kind 契约，并要求 build-check 关闭已构建 Case；0.3.4 固化 UnknownState/CandidateBatch 的不可变语义身份；0.3.3 增加 CandidateBatch 语义/数值双视图、StateRef trajectory 与正式 StateRelease；0.3.2 增加 Problem Evaluation Provider 的正式状态协议：`StateRef` 只表示
 Provider 进程内活状态；Adapter 通过版本栅栏 `StateTransitionRequest` 选择更新机制，
 再通过 `StateMaterializationRequest` 导出 `UnknownState` 或 `DataRef`。旧进程活引用
 不能作为 checkpoint 或 Artifact 恢复。

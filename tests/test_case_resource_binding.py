@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
 import pytest
 
-from blackbase.project import ProjectConfigurationError, build_case
+from blackbase.project import CaseRunRequest, ProjectConfigurationError, build_case
 from blackbase.project.scaffold import add_case, create_project
 
 
@@ -61,6 +62,40 @@ def test_build_case_rejects_case_that_changes_authoritative_grant() -> None:
         build_case(builder, resource_context={"threads": 1, "namespace": "p.c"})
 
 
+def test_build_case_recursively_thaws_wire_component_overrides() -> None:
+    request = CaseRunRequest(
+        project_name="test-project",
+        stage_name="test-stage",
+        case_name="mutable_overrides",
+        component_overrides={
+            "pipeline": {
+                "stages": ["encode", "evaluate"],
+                "options": {"strict": True},
+            }
+        },
+    )
+
+    def builder(*, resource_context=None, component_overrides=None):
+        del resource_context
+        component_overrides["pipeline"]["stages"].append("decode")
+        component_overrides["pipeline"]["options"]["strict"] = False
+        return component_overrides
+
+    built = build_case(builder, component_overrides=request.component_overrides)
+
+    assert built == {
+        "pipeline": {
+            "stages": ["encode", "evaluate", "decode"],
+            "options": {"strict": False},
+        }
+    }
+    assert tuple(request.component_overrides["pipeline"]["stages"]) == (
+        "encode",
+        "evaluate",
+    )
+    assert request.component_overrides["pipeline"]["options"]["strict"] is True
+
+
 def test_generated_case_cli_runs_directly_with_package_relative_builder_imports(tmp_path) -> None:
     project_root = create_project(tmp_path / "direct_cli", framework="blackbase")
     case_root = add_case("demo", "solver", project_root=project_root)
@@ -87,5 +122,6 @@ def test_generated_case_cli_runs_directly_with_package_relative_builder_imports(
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert '"current": true' in completed.stdout
-    assert '"status": "assembly ok"' in completed.stdout
+    payload = json.loads(completed.stdout.removeprefix("[check] "))
+    assert payload["resource_binding"] == {}
+    assert payload["status"] == "assembly ok"

@@ -27,6 +27,7 @@ from blackbase.resources import (
     TaskTransport,
     TerminationPolicy,
 )
+from blackbase.wire import thaw_wire_value
 
 from .case_execution import execute_case_payload
 from .execution import (
@@ -1728,7 +1729,15 @@ def _print_project_check(
 
 
 def _print_project_message(payload: Mapping[str, Any], *, label: str = "project-runtime") -> None:
-    print(f"[{label}] " + json.dumps(dict(payload), ensure_ascii=False, sort_keys=True), flush=True)
+    # Shared protocol objects expose recursively immutable mappings.  Logging is
+    # a wire boundary, so detach them before JSON encoding instead of allowing a
+    # diagnostic side effect to turn a successful Case into a failed run.
+    printable = thaw_wire_value(dict(payload))
+    print(
+        f"[{label}] "
+        + json.dumps(printable, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

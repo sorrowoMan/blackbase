@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
+
+from blackbase.wire import thaw_wire_mapping
 from uuid import uuid4
 
 from blackbase.resources import (
@@ -151,8 +153,8 @@ def load_resource_context_from_env(
     framework: str | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Load the Project-granted ResourceContext passed to a CLI-mode Case."""
+) -> dict[str, Any] | None:
+    """Load a CLI Case grant while preserving absent-vs-empty provenance."""
 
     source = os.environ if environ is None else environ
     keys: list[str] = []
@@ -171,7 +173,7 @@ def load_resource_context_from_env(
         if not isinstance(payload, Mapping):
             raise ValueError(f"{key} must contain a JSON object")
         return dict(payload)
-    return {}
+    return None
 _SUPPORTED_CASE_KINDS = {"solver", "trainer"}
 
 
@@ -302,11 +304,14 @@ class ResourceLeaseGuard:
     def __init__(self, runtime: "ProjectL0Runtime", lease: ResourceLease) -> None:
         self.runtime = runtime
         self.lease = lease
+        self._lease_lock = threading.RLock()
         self._stop = threading.Event()
         self._lost = threading.Event()
         renewed = self.runtime.allocator.renew(self.lease)
         if renewed is None:
             self._lost.set()
+        else:
+            self.lease = renewed
         self._thread = threading.Thread(
             target=self._run,
             name=f"blackbase-l0-heartbeat-{lease.lease_id}",
@@ -322,15 +327,21 @@ class ResourceLeaseGuard:
     def _run(self) -> None:
         interval = self.runtime.config.lease_heartbeat_seconds
         while not self._stop.wait(interval):
-            if self.runtime.allocator.renew(self.lease) is None:
+            with self._lease_lock:
+                renewed = self.runtime.allocator.renew(self.lease)
+                if renewed is not None:
+                    self.lease = renewed
+            if renewed is None:
                 self._lost.set()
                 return
 
     def assert_current(self) -> None:
-        if self.lost or not self.runtime.allocator.is_current(self.lease):
+        with self._lease_lock:
+            lease = self.lease
+        if self.lost or not self.runtime.allocator.is_current(lease):
             raise ResourceLeaseFenceError(
                 f"Project L0 lease fence is no longer current: "
-                f"lease_id='{self.lease.lease_id}' token={self.lease.fencing_token}"
+                f"lease_id='{lease.lease_id}' token={lease.fencing_token}"
             )
 
     def close(self) -> None:
@@ -768,7 +779,7 @@ def build_case(
     """Call a canonical Case builder under the required shared injection contract."""
 
     payload = _as_dict(resource_context) if resource_context is not None else None
-    overrides = dict(component_overrides or {})
+    overrides = thaw_wire_mapping(component_overrides)
     accepts = getattr(builder, "accepts_parameter", None)
     if callable(accepts):
         missing = [

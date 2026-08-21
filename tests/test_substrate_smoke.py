@@ -44,7 +44,7 @@ def test_run_case_applies_optional_semantic_result_exporter() -> None:
     assert run_case(_Case(), case_kind="solver") == {"projected_value": 4}
 
 
-def test_resource_context_child_keeps_parent_lease_and_clamps_threads() -> None:
+def test_resource_context_view_keeps_parent_authority_without_minting_subgrant() -> None:
     parent = ResourceContext.from_mapping(
         {
             "scope": "optimization",
@@ -56,10 +56,9 @@ def test_resource_context_child_keeps_parent_lease_and_clamps_threads() -> None:
         }
     )
 
-    child = parent.derive_child(
+    child = parent.derive_view(
         scope="training",
         namespace_suffix="inner",
-        threads=99,
         metadata={"bridge": "nsgablack->mlblack"},
     )
 
@@ -68,6 +67,7 @@ def test_resource_context_child_keeps_parent_lease_and_clamps_threads() -> None:
     assert child.namespace == "project.case.inner"
     assert child.lease["lease_id"] == "lease-parent"
     assert child.metadata["parent_lease_id"] == "lease-parent"
+    assert child.metadata["resource_view_non_owning"] is True
     assert child.metadata["bridge"] == "nsgablack->mlblack"
 
 
@@ -405,11 +405,14 @@ class Case:
         self.component_overrides = dict(component_overrides or {})
 
     def run(self):
+        model_ref = self.case_runtime.publish_artifact(
+            "model",
+            {"trained": True},
+            kind="model",
+        )
         return {
             "entry": "run",
-            "artifact_refs": {
-                "model": {"uri": "memory://trained/model", "kind": "model"},
-            },
+            "artifact_refs": {"model": model_ref},
         }
 
 
@@ -480,11 +483,11 @@ GROUPS = {"default": {"stages": ["main"]}}
     assert result.case_results[0].output["entry"] == "run"
     assert result.case_results[1].output == {
         "entry": "fit",
-        "model_uri": "memory://trained/model",
+        "model_uri": result.artifact_registry["producer.model"].uri,
         "overrides": {"trainer": {"max_steps": 2}},
     }
     assert result.artifact_registry["main.producer.model"].kind == "model"
-    assert result.artifact_registry["producer.model"].uri == "memory://trained/model"
+    assert Path(result.artifact_registry["producer.model"].uri).is_file()
     assert run_project(project_root) == 0
 
 
@@ -503,15 +506,18 @@ class Case:
     def run(self):
         started_at = time.time()
         time.sleep(0.35)
+        result_ref = self.case_runtime.publish_artifact(
+            "result",
+            {"pid": os.getpid()},
+            kind="result",
+        )
         return {
             "pid": os.getpid(),
             "started_at": started_at,
             "finished_at": time.time(),
             "lease_id": self.resource_context["lease"]["lease_id"],
             "threads": self.resource_context["threads"],
-            "artifact_refs": {
-                "result": {"uri": "memory://parallel/" + str(os.getpid()), "kind": "result"},
-            },
+            "artifact_refs": {"result": result_ref},
         }
 
 
@@ -592,7 +598,7 @@ GROUPS = {"default": {"stages": ["parallel", "consume"]}}
     assert max(item["started_at"] for item in outputs) < min(
         item["finished_at"] for item in outputs
     )
-    assert result.case_results[2].output["producer_uris"] == sorted(
+    assert list(result.case_results[2].output["producer_uris"]) == sorted(
         [item["artifact_refs"]["result"]["uri"] for item in outputs]
     )
     assert result.artifact_registry["parallel.case_a.result"].kind == "result"
@@ -685,11 +691,14 @@ class Case:
         counter = root / "producer.count"
         count = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
         counter.write_text(str(count), encoding="utf-8")
+        model_ref = self.case_runtime.publish_artifact(
+            "model",
+            {"count": count},
+            kind="model",
+        )
         return {
             "count": count,
-            "artifact_refs": {
-                "model": {"uri": "memory://resume/model", "kind": "model"},
-            },
+            "artifact_refs": {"model": model_ref},
         }
 
 def build_solver(config=None, *, resource_context=None, component_overrides=None):
@@ -757,7 +766,8 @@ GROUPS = {"default": {"stages": ["produce", "consume"]}}
         "succeeded",
         "failed",
     ]
-    assert first_manifest["artifact_registry"]["producer.model"]["uri"] == "memory://resume/model"
+    model_uri = first_manifest["artifact_registry"]["producer.model"]["uri"]
+    assert Path(model_uri).is_file()
 
     resumed = execute_project(
         project_root,
@@ -768,7 +778,7 @@ GROUPS = {"default": {"stages": ["produce", "consume"]}}
     assert resumed.ok
     assert [item.status for item in resumed.case_results] == ["resumed", "succeeded"]
     assert resumed.case_results[1].output == {
-        "model_uri": "memory://resume/model",
+        "model_uri": model_uri,
         "count": 2,
     }
     assert (project_root / "producer.count").read_text(encoding="utf-8") == "1"

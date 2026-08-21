@@ -36,6 +36,8 @@ def run_standard_case_cli(
     project_root = case_root.parent.parent
     case_name = case_root.name
     case_kind = load_case_kind(project_root, case_name)
+    # ``None`` means standalone.  An explicit ``{}`` remains an authoritative
+    # injected payload and must still pass post-build binding validation.
     resource_context = load_resource_context_from_env(framework)
     builder = load_case_builder(project_root, case_name, case_kind=case_kind)
     case_obj = build_case(builder, resource_context=resource_context, component_overrides={})

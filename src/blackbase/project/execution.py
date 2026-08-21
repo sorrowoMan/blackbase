@@ -5,10 +5,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from blackbase.resources import BudgetHandle, CancellationRef, DataRef, TerminationPolicy
+from blackbase.wire import freeze_wire_mapping, thaw_wire_mapping
 
 
 CASE_RUN_SCHEMA_VERSION = 1
@@ -140,7 +142,14 @@ class ExecutionControl:
         object.__setattr__(self, "cancellation", current)
         object.__setattr__(self, "ancestor_cancellations", ancestors)
         object.__setattr__(self, "termination", termination)
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(
+                _transport_safe(self.metadata, path="control.metadata"),
+                path="control.metadata",
+            ),
+        )
 
     @property
     def deadline_at(self) -> float:
@@ -228,7 +237,7 @@ class ExecutionControl:
             "ancestor_cancellations": [item.as_dict() for item in self.ancestor_cancellations],
             "deadline_at": self.deadline_at,
             "termination": self.termination.as_dict(),
-            "metadata": _transport_safe(self.metadata, path="control.metadata"),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -255,9 +264,23 @@ class ChildResourceGrant:
         object.__setattr__(self, "parent_lease_id", str(self.parent_lease_id or ""))
         object.__setattr__(self, "parent_case_run_id", str(self.parent_case_run_id or ""))
         object.__setattr__(self, "namespace", str(self.namespace or ""))
-        object.__setattr__(self, "resources", resources)
+        object.__setattr__(
+            self,
+            "resources",
+            freeze_wire_mapping(
+                _transport_safe(resources, path="child_grant.resources"),
+                path="child_grant.resources",
+            ),
+        )
         object.__setattr__(self, "fencing_token", max(0, int(self.fencing_token or 0)))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(
+                _transport_safe(self.metadata, path="child_grant.metadata"),
+                path="child_grant.metadata",
+            ),
+        )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ChildResourceGrant":
@@ -277,9 +300,9 @@ class ChildResourceGrant:
             "parent_lease_id": self.parent_lease_id,
             "parent_case_run_id": self.parent_case_run_id,
             "namespace": self.namespace,
-            "resources": _transport_safe(self.resources, path="child_grant.resources"),
+            "resources": thaw_wire_mapping(self.resources),
             "fencing_token": self.fencing_token,
-            "metadata": _transport_safe(self.metadata, path="child_grant.metadata"),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -306,8 +329,22 @@ class CaseFailure:
         object.__setattr__(self, "phase", str(self.phase or "run"))
         object.__setattr__(self, "retryable", bool(self.retryable))
         object.__setattr__(self, "traceback_ref", ref)
-        object.__setattr__(self, "cause", dict(self.cause or {}))
-        object.__setattr__(self, "details", dict(self.details or {}))
+        object.__setattr__(
+            self,
+            "cause",
+            freeze_wire_mapping(
+                _transport_safe(self.cause, path="failure.cause"),
+                path="failure.cause",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "details",
+            freeze_wire_mapping(
+                _transport_safe(self.details, path="failure.details"),
+                path="failure.details",
+            ),
+        )
 
     @classmethod
     def from_exception(
@@ -318,6 +355,44 @@ class CaseFailure:
         retryable: bool = False,
         details: Mapping[str, Any] | None = None,
     ) -> "CaseFailure":
+        if isinstance(exc, CaseInvocationError):
+            result = exc.result
+            child_failure = result.failure
+            nested_cause = (
+                child_failure.as_dict()
+                if child_failure is not None
+                else {
+                    "kind": "CaseRunFailure",
+                    "message": result.error or f"child Case status={result.status}",
+                    "phase": "run",
+                    "retryable": False,
+                    "traceback_ref": None,
+                    "cause": {},
+                    "details": {},
+                }
+            )
+            failure_details = dict(details or {})
+            failure_details["child_case"] = {
+                "identity": result.identity.as_dict(),
+                "project_name": result.request.project_name,
+                "stage_name": result.request.stage_name,
+                "case_name": result.request.case_name,
+                "case_kind": result.request.case_kind,
+                "status": result.status,
+                "exit_code": result.exit_code,
+            }
+            return cls(
+                kind="CaseInvocationError",
+                message=str(exc),
+                phase=phase,
+                retryable=(
+                    bool(child_failure.retryable)
+                    if child_failure is not None
+                    else bool(retryable)
+                ),
+                cause=nested_cause,
+                details=failure_details,
+            )
         return cls(
             kind=type(exc).__name__,
             message=str(exc),
@@ -348,8 +423,8 @@ class CaseFailure:
             "phase": self.phase,
             "retryable": self.retryable,
             "traceback_ref": None if self.traceback_ref is None else self.traceback_ref.as_dict(),
-            "cause": _transport_safe(self.cause, path="failure.cause"),
-            "details": _transport_safe(self.details, path="failure.details"),
+            "cause": thaw_wire_mapping(self.cause),
+            "details": thaw_wire_mapping(self.details),
         }
 
 
@@ -409,22 +484,66 @@ class CaseRunRequest:
         object.__setattr__(self, "mode", str(self.mode or "build"))
         object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "control", control)
-        object.__setattr__(self, "resource_request", dict(self.resource_request or {}))
+        object.__setattr__(
+            self,
+            "resource_request",
+            freeze_wire_mapping(
+                _transport_safe(
+                    self.resource_request,
+                    path="request.resource_request",
+                ),
+                path="request.resource_request",
+            ),
+        )
         budgets = {
             str(key): int(value)
             for key, value in dict(self.budget_request or {}).items()
         }
         if any(value < 0 for value in budgets.values()):
             raise ValueError("Case budget_request values must be non-negative")
-        object.__setattr__(self, "budget_request", budgets)
-        object.__setattr__(self, "resource_context", dict(self.resource_context or {}))
+        object.__setattr__(self, "budget_request", MappingProxyType(budgets))
+        object.__setattr__(
+            self,
+            "resource_context",
+            freeze_wire_mapping(
+                _transport_safe(
+                    self.resource_context,
+                    path="request.resource_context",
+                ),
+                path="request.resource_context",
+            ),
+        )
         object.__setattr__(self, "child_grant", child_grant)
-        object.__setattr__(self, "budget_handles", handles)
-        object.__setattr__(self, "component_overrides", dict(self.component_overrides or {}))
-        object.__setattr__(self, "input_artifacts", refs)
-        object.__setattr__(self, "inputs", dict(self.inputs or {}))
+        object.__setattr__(self, "budget_handles", MappingProxyType(handles))
+        object.__setattr__(
+            self,
+            "component_overrides",
+            freeze_wire_mapping(
+                _transport_safe(
+                    self.component_overrides,
+                    path="request.component_overrides",
+                ),
+                path="request.component_overrides",
+            ),
+        )
+        object.__setattr__(self, "input_artifacts", MappingProxyType(refs))
+        object.__setattr__(
+            self,
+            "inputs",
+            freeze_wire_mapping(
+                _transport_safe(self.inputs, path="request.inputs"),
+                path="request.inputs",
+            ),
+        )
         object.__setattr__(self, "argv", tuple(str(item) for item in self.argv))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(
+                _transport_safe(self.metadata, path="request.metadata"),
+                path="request.metadata",
+            ),
+        )
         object.__setattr__(self, "schema_version", CASE_RUN_SCHEMA_VERSION)
 
     @classmethod
@@ -548,16 +667,44 @@ class CaseRunResult:
             elapsed = max(0.0, finished - started)
         object.__setattr__(self, "request", request)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "output", dict(self.output or {}))
-        object.__setattr__(self, "artifact_refs", refs)
-        object.__setattr__(self, "resource_usage", dict(self.resource_usage or {}))
-        object.__setattr__(self, "budget_usage", dict(self.budget_usage or {}))
+        object.__setattr__(
+            self,
+            "output",
+            freeze_wire_mapping(
+                _transport_safe(self.output, path="result.output"),
+                path="result.output",
+            ),
+        )
+        object.__setattr__(self, "artifact_refs", MappingProxyType(refs))
+        object.__setattr__(
+            self,
+            "resource_usage",
+            freeze_wire_mapping(
+                _transport_safe(self.resource_usage, path="result.resource_usage"),
+                path="result.resource_usage",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "budget_usage",
+            freeze_wire_mapping(
+                _transport_safe(self.budget_usage, path="result.budget_usage"),
+                path="result.budget_usage",
+            ),
+        )
         object.__setattr__(self, "started_at", started)
         object.__setattr__(self, "finished_at", finished)
         object.__setattr__(self, "elapsed_seconds", elapsed)
         object.__setattr__(self, "exit_code", int(self.exit_code or 0))
         object.__setattr__(self, "failure", failure)
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(
+                _transport_safe(self.metadata, path="result.metadata"),
+                path="result.metadata",
+            ),
+        )
         object.__setattr__(self, "schema_version", CASE_RUN_SCHEMA_VERSION)
 
     @property
@@ -581,6 +728,13 @@ class CaseRunResult:
             and self.status in CASE_RUN_SUCCESS_STATUSES
             and self.failure is None
         )
+
+    def raise_for_failure(self, message: str = "") -> "CaseRunResult":
+        """Raise a structured nested invocation error when this result failed."""
+
+        if not self.ok:
+            raise CaseInvocationError(self, message=message)
+        return self
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "CaseRunResult":
@@ -641,6 +795,27 @@ class CaseRunResult:
         }
 
 
+class CaseInvocationError(RuntimeError):
+    """Failure raised by a parent while retaining the complete child envelope."""
+
+    def __init__(self, result: CaseRunResult, *, message: str = "") -> None:
+        if not isinstance(result, CaseRunResult):
+            raise TypeError("CaseInvocationError.result must be a CaseRunResult")
+        if result.ok:
+            raise ValueError("cannot raise CaseInvocationError for a successful result")
+        self.result = result
+        label = "/".join(
+            (
+                result.request.project_name,
+                result.request.stage_name,
+                result.request.case_name,
+            )
+        )
+        prefix = str(message or "child Case invocation failed").strip()
+        detail = result.error or f"status={result.status}, exit_code={result.exit_code}"
+        super().__init__(f"{prefix}: {label}: {detail}")
+
+
 @dataclass(frozen=True)
 class ProjectRunResult:
     """Structured Project result retained independently from the CLI exit code."""
@@ -659,7 +834,11 @@ class ProjectRunResult:
         object.__setattr__(self, "project_name", str(self.project_name))
         object.__setattr__(self, "group", str(self.group))
         object.__setattr__(self, "case_results", tuple(self.case_results or ()))
-        object.__setattr__(self, "artifact_registry", dict(self.artifact_registry or {}))
+        object.__setattr__(
+            self,
+            "artifact_registry",
+            MappingProxyType(dict(self.artifact_registry or {})),
+        )
         object.__setattr__(self, "status", str(self.status or "unknown"))
         object.__setattr__(self, "exit_code", int(self.exit_code or 0))
         object.__setattr__(self, "run_id", str(self.run_id or ""))
@@ -720,6 +899,7 @@ __all__ = [
     "CASE_RUN_SCHEMA_VERSION",
     "CASE_RUN_STATUSES",
     "CaseFailure",
+    "CaseInvocationError",
     "CaseRunIdentity",
     "CaseRunRequest",
     "CaseRunResult",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blackbase"
-version = "0.3.6"
+version = "0.3.8"
 description = "Shared foundation for NSGABlack and MLBlack frameworks"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -14,6 +14,7 @@ from .doctor import DoctorDiagnostic, DoctorReport, format_doctor_report, run_co
 from .execution import (
     CASE_RUN_SCHEMA_VERSION,
     CaseFailure,
+    CaseInvocationError,
     CaseRunIdentity,
     CaseRunRequest,
     CaseRunResult,
@@ -59,6 +60,7 @@ __all__ = [
     "CASE_RESOURCE_BINDING_SCHEMA_VERSION",
     "CaseExecutor",
     "CaseFailure",
+    "CaseInvocationError",
     "CaseInvoker",
     "CaseRunIdentity",
     "CaseRunRequest",

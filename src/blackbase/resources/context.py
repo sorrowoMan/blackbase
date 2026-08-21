@@ -7,6 +7,8 @@ from time import time
 from typing import Any, Mapping
 from uuid import uuid4
 
+from blackbase.wire import freeze_wire_mapping, thaw_wire_mapping
+
 
 # ============================================================================
 # Resource Context
@@ -42,9 +44,21 @@ class ResourceContext:
         object.__setattr__(self, "threads", max(1, int(self.threads or 1)))
         object.__setattr__(self, "nested", bool(self.nested))
         object.__setattr__(self, "namespace", str(self.namespace or ""))
-        object.__setattr__(self, "grant", dict(self.grant or {}))
-        object.__setattr__(self, "lease", dict(self.lease or {}))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "grant",
+            freeze_wire_mapping(self.grant, path="resource_context.grant"),
+        )
+        object.__setattr__(
+            self,
+            "lease",
+            freeze_wire_mapping(self.lease, path="resource_context.lease"),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="resource_context.metadata"),
+        )
     
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | "ResourceContext" | None) -> "ResourceContext":
@@ -91,50 +105,49 @@ class ResourceContext:
             "threads": int(self.threads),
             "nested": bool(self.nested),
             "namespace": self.namespace,
-            "grant": dict(self.grant),
-            "resources": dict(self.grant),
-            "lease": dict(self.lease),
-            "metadata": dict(self.metadata),
+            "grant": thaw_wire_mapping(self.grant),
+            "resources": thaw_wire_mapping(self.grant),
+            "lease": thaw_wire_mapping(self.lease),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
-    def derive_child(
+    def derive_view(
         self,
         *,
         scope: str,
         namespace_suffix: str = "",
-        threads: int | None = None,
-        execution_backend: str | None = None,
-        compute_backend: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "ResourceContext":
-        """Derive a nested subgrant without minting a new Project-level lease."""
+        """Derive a non-owning namespace view of the same authoritative grant.
 
-        child_threads = int(self.threads) if threads is None else max(1, min(int(threads), int(self.threads)))
+        This method never partitions resources and therefore cannot authorize
+        concurrent child work.  Callers that need an exclusive or concurrent
+        child allocation must acquire it through ``ResourceGrantPool`` or the
+        standard recursive Case invocation boundary.
+        """
+
         suffix = str(namespace_suffix or "").strip(".")
         namespace = str(self.namespace or "").strip(".")
         if suffix:
             namespace = f"{namespace}.{suffix}" if namespace else suffix
-        grant = dict(self.grant)
-        grant["threads"] = child_threads
-        if "workers" in grant:
-            grant["workers"] = min(max(1, int(grant.get("workers", child_threads) or child_threads)), child_threads)
-        lease = dict(self.lease)
+        lease = thaw_wire_mapping(self.lease)
         lease_id = str(lease.get("lease_id", ""))
         child_metadata = {
-            **dict(self.metadata),
+            **thaw_wire_mapping(self.metadata),
             "parent_namespace": str(self.namespace),
             "parent_lease_id": lease_id,
+            "resource_view_non_owning": True,
             **dict(metadata or {}),
         }
         return ResourceContext(
             scope=str(scope or self.scope),
-            execution_backend=str(execution_backend or self.execution_backend),
-            compute_backend=str(compute_backend or self.compute_backend),
+            execution_backend=str(self.execution_backend),
+            compute_backend=str(self.compute_backend),
             device=str(self.device),
-            threads=child_threads,
+            threads=int(self.threads),
             nested=True,
             namespace=namespace,
-            grant=grant,
+            grant=thaw_wire_mapping(self.grant),
             lease=lease,
             metadata=child_metadata,
         )
@@ -152,8 +165,8 @@ class ResourceContext:
             f"{base}.threads": int(self.threads),
             f"{base}.nested": bool(self.nested),
             f"{base}.namespace": self.namespace,
-            f"{base}.resources": dict(self.grant),
-            f"{base}.lease": dict(self.lease),
+            f"{base}.resources": thaw_wire_mapping(self.grant),
+            f"{base}.lease": thaw_wire_mapping(self.lease),
         }
 
 

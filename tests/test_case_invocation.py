@@ -3,8 +3,12 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from blackbase.project import (
     CaseExecutor,
+    CaseFailure,
+    CaseInvocationError,
     CaseRunRequest,
     CaseRunResult,
     ExecutionControl,
@@ -41,15 +45,18 @@ class Child:
         claim = account.reserve(3)
         account.consume(claim, 2)
         account.complete(claim)
+        answer_ref = self.case_runtime.publish_artifact(
+            "answer",
+            {"value": self.case_inputs["value"] * 2},
+            kind="result",
+        )
         return {
             "value": self.case_inputs["value"] * 2,
             "identity": self.case_runtime.identity.as_dict(),
             "control": self.case_runtime.control.as_dict(),
             "threads": self.resource_context["threads"],
             "grant": self.resource_context["metadata"]["child_grant"],
-            "artifact_refs": {
-                "answer": {"uri": "memory://nested/answer", "kind": "result"},
-            },
+            "artifact_refs": {"answer": answer_ref},
         }
 
 
@@ -81,7 +88,7 @@ class Parent:
         )
         return {
             "child": child.as_dict(),
-            "artifact_refs": {"answer": child.artifact_refs["answer"].as_dict()},
+            "artifact_refs": {"answer": child.artifact_refs["answer"]},
         }
 
 
@@ -128,9 +135,9 @@ GROUPS = {"default": {"stages": ["outer"]}}
     )
     assert child_result.budget_usage["evaluations"]["charged_to_parent"] == 2
     assert child_result.budget_usage["evaluations"]["returned_to_parent"] == 1
-    assert child_result.artifact_refs["answer"].uri == "memory://nested/answer"
-    assert project_result.artifact_registry["parent.answer"].uri == (
-        "memory://nested/answer"
+    assert child_result.artifact_refs["answer"].uri
+    assert project_result.artifact_registry["parent.answer"] == (
+        child_result.artifact_refs["answer"]
     )
 
 
@@ -329,7 +336,7 @@ GROUPS = {"default": {"stages": ["outer"]}}
     assert resources["workers"] == 1
     assert resources["threads"] == 1
     assert resources["memory_mb"] == 256.0
-    assert resources["capabilities"] == ["base"]
+    assert resources["capabilities"] == ("base",)
     for name in (
         "too_many_workers",
         "too_much_memory",
@@ -416,6 +423,59 @@ def test_case_result_envelope_round_trips_strict_schema() -> None:
 
     assert restored == result
     assert restored.elapsed_seconds == 1.5
+
+
+def test_failed_child_result_raises_structured_invocation_error() -> None:
+    request = CaseRunRequest(
+        project_name="nested",
+        stage_name="inner",
+        case_name="child",
+    )
+    child_failure = CaseFailure(
+        kind="EvaluationError",
+        message="objective failed",
+        phase="evaluate",
+        retryable=True,
+        details={"evaluation_id": "eval-7"},
+    )
+    result = CaseRunResult(
+        request=request,
+        status="failed",
+        exit_code=1,
+        failure=child_failure,
+    )
+
+    with pytest.raises(CaseInvocationError) as caught:
+        result.raise_for_failure("inner optimization failed")
+
+    assert caught.value.result is result
+    parent_failure = CaseFailure.from_exception(
+        caught.value,
+        phase="evaluate",
+        details={"candidate_id": "candidate-3"},
+    )
+    assert parent_failure.kind == "CaseInvocationError"
+    assert parent_failure.retryable is True
+    assert parent_failure.cause == child_failure.as_dict()
+    assert parent_failure.details["candidate_id"] == "candidate-3"
+    child_details = parent_failure.details["child_case"]
+    assert child_details["identity"] == result.identity.as_dict()
+    assert child_details["case_name"] == "child"
+    assert child_details["status"] == "failed"
+
+
+def test_successful_child_result_raise_for_failure_is_a_noop() -> None:
+    result = CaseRunResult(
+        request=CaseRunRequest(
+            project_name="nested",
+            stage_name="inner",
+            case_name="child",
+        ),
+        status="succeeded",
+        output={"value": 3},
+    )
+
+    assert result.raise_for_failure() is result
 
 
 def test_reusing_child_request_mints_distinct_run_and_budget_namespaces(tmp_path) -> None:

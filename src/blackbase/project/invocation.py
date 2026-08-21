@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from threading import Condition, RLock
+from threading import RLock
 from typing import Any, Iterator, Mapping, Sequence
 from uuid import uuid4
 
@@ -21,8 +21,10 @@ from blackbase.resources import (
     CancellationToken,
     CaseDeadlineExceeded,
     DataRef,
+    ResourceGrantPool,
     ResourceContext,
     ResourceRequest,
+    ResourceSubgrantError,
     build_budget_authority_from_resource_context,
 )
 
@@ -164,60 +166,12 @@ class CaseRuntimeContext:
         }
 
 
-class _ChildGrantPool:
-    """Atomically partitions one parent grant among concurrent child calls."""
+class _CaseChildGrantAdapter:
+    """Project-specific projection over the single shared resource ledger."""
 
     def __init__(self, parent_request: CaseRunRequest) -> None:
         self.parent_request = parent_request
-        parent = ResourceContext.from_mapping(parent_request.resource_context)
-        grant = dict(parent.grant or {})
-        lease_resources = dict(dict(parent.lease or {}).get("resources", {}) or {})
-        self._total_workers = max(
-            1,
-            int(grant.get("workers", lease_resources.get("workers", 1)) or 1),
-        )
-        self._total_threads = max(1, int(grant.get("threads", parent.threads) or parent.threads))
-        self._total_gpus = max(0, int(grant.get("gpus", 0) or 0))
-        self._total_memory_mb = max(
-            0.0,
-            float(grant.get("memory_mb", lease_resources.get("memory_mb", 0.0)) or 0.0),
-        )
-        self._total_gpu_memory_mb = max(
-            0.0,
-            float(
-                grant.get(
-                    "gpu_memory_mb",
-                    lease_resources.get("gpu_memory_mb", 0.0),
-                )
-                or 0.0
-            ),
-        )
-        self._device_tokens = tuple(str(item) for item in grant.get("device_tokens", ()) or ())
-        self._parent_backend = str(
-            grant.get("backend", lease_resources.get("backend", "local")) or "local"
-        )
-        self._parent_compute_backend = str(
-            parent.compute_backend
-            or grant.get("compute_backend", lease_resources.get("compute_backend", "auto"))
-            or "auto"
-        )
-        self._parent_device = str(parent.device or grant.get("device", "cpu") or "cpu")
-        self._parent_capabilities = tuple(
-            str(item)
-            for item in grant.get(
-                "capabilities",
-                lease_resources.get("capabilities", ()),
-            )
-            or ()
-        )
-        self._available_workers = self._total_workers
-        self._available_threads = self._total_threads
-        self._available_gpus = self._total_gpus
-        self._available_memory_mb = self._total_memory_mb
-        self._available_gpu_memory_mb = self._total_gpu_memory_mb
-        self._available_tokens = list(self._device_tokens)
-        self._condition = Condition(RLock())
-        self._active: dict[str, ChildResourceGrant] = {}
+        self._pool = ResourceGrantPool(parent_request.resource_context)
 
     @contextmanager
     def acquire(
@@ -228,224 +182,39 @@ class _ChildGrantPool:
         control: ExecutionControl,
         checkpoint: Any,
     ) -> Iterator[ChildResourceGrant]:
-        workers = int(request.workers)
-        threads = int(request.threads)
-        requested_tokens = tuple(str(item) for item in request.device_tokens)
-        if len(set(requested_tokens)) != len(requested_tokens):
-            raise ProjectConfigurationError("child Case device_tokens must be unique")
-        gpus = max(int(request.gpus), len(requested_tokens))
-        memory_mb = max(0.0, float(request.memory_mb or 0.0))
-        gpu_memory_mb = max(0.0, float(request.gpu_memory_mb or 0.0))
-        backend, compute_backend, device = self._validate_qualitative_request(request)
-        if workers > self._total_workers:
-            raise ProjectConfigurationError(
-                f"child Case requests {workers} workers but parent grant has "
-                f"{self._total_workers}"
-            )
-        if threads > self._total_threads:
-            raise ProjectConfigurationError(
-                f"child Case requests {threads} threads but parent grant has {self._total_threads}"
-            )
-        if gpus > self._total_gpus:
-            raise ProjectConfigurationError(
-                f"child Case requests {gpus} GPUs but parent grant has {self._total_gpus}"
-            )
-        if memory_mb > self._total_memory_mb:
-            raise ProjectConfigurationError(
-                f"child Case requests {memory_mb:g} MB memory but parent grant has "
-                f"{self._total_memory_mb:g} MB"
-            )
-        if gpu_memory_mb > self._total_gpu_memory_mb:
-            raise ProjectConfigurationError(
-                f"child Case requests {gpu_memory_mb:g} MB GPU memory but parent grant has "
-                f"{self._total_gpu_memory_mb:g} MB"
-            )
-        if requested_tokens and not set(requested_tokens).issubset(self._device_tokens):
-            raise ProjectConfigurationError(
-                "child Case requests device tokens outside the parent grant"
-            )
-        allocated_tokens: tuple[str, ...] = ()
-        with self._condition:
-            while True:
-                checkpoint()
-                tokens_available = (
-                    all(token in self._available_tokens for token in requested_tokens)
-                    if requested_tokens
-                    else (
-                        len(self._available_tokens) >= gpus
-                        if self._device_tokens
-                        else True
-                    )
-                )
-                if (
-                    self._available_workers >= workers
-                    and self._available_threads >= threads
-                    and self._available_gpus >= gpus
-                    and self._available_memory_mb >= memory_mb
-                    and self._available_gpu_memory_mb >= gpu_memory_mb
-                    and tokens_available
-                ):
-                    break
-                remaining = control.deadline_at - time.time() if control.deadline_at > 0 else 0.05
-                if control.deadline_at > 0 and remaining <= 0:
-                    checkpoint()
-                self._condition.wait(timeout=min(0.05, max(0.001, remaining)))
-            self._available_workers -= workers
-            self._available_threads -= threads
-            self._available_gpus -= gpus
-            self._available_memory_mb -= memory_mb
-            self._available_gpu_memory_mb -= gpu_memory_mb
-            if requested_tokens:
-                allocated_tokens = requested_tokens
-            elif gpus:
-                allocated_tokens = tuple(self._available_tokens[:gpus])
-            for token in allocated_tokens:
-                self._available_tokens.remove(token)
-            parent_context = ResourceContext.from_mapping(self.parent_request.resource_context)
-            parent_lease = dict(parent_context.lease or {})
-            namespace = ".".join(
-                item
-                for item in (
-                    parent_context.namespace,
-                    "child",
-                    identity.case_run_id,
-                )
-                if item
-            )
-            resources = {
-                "workers": workers,
-                "threads": threads,
-                "gpus": gpus,
-                "memory_mb": memory_mb or None,
-                "gpu_memory_mb": gpu_memory_mb or None,
-                "device_tokens": list(allocated_tokens),
-                "backend": backend,
-                "compute_backend": compute_backend,
-                "device": device,
-                "capabilities": list(request.capabilities),
-            }
-            grant = ChildResourceGrant(
-                grant_id=f"child-grant-{uuid4().hex}",
-                parent_lease_id=str(parent_lease.get("lease_id", "")),
-                parent_case_run_id=self.parent_request.identity.case_run_id,
-                namespace=namespace,
-                resources=resources,
-                fencing_token=int(parent_lease.get("fencing_token", 0) or 0),
-                metadata={"resource_request": request.as_dict()},
-            )
-            self._active[grant.grant_id] = grant
+        parent = ResourceContext.from_mapping(self.parent_request.resource_context)
+        parent_lease = dict(parent.lease or {})
         try:
-            yield grant
-        finally:
-            with self._condition:
-                self._active.pop(grant.grant_id, None)
-                self._available_workers += workers
-                self._available_threads += threads
-                self._available_gpus += gpus
-                self._available_memory_mb += memory_mb
-                self._available_gpu_memory_mb += gpu_memory_mb
-                self._available_tokens.extend(allocated_tokens)
-                ordered = {token: index for index, token in enumerate(self._device_tokens)}
-                self._available_tokens.sort(key=lambda token: ordered.get(token, len(ordered)))
-                self._condition.notify_all()
-
-    def _validate_qualitative_request(
-        self,
-        request: ResourceRequest,
-    ) -> tuple[str, str, str]:
-        backend = self._resolve_bounded_value(
-            request.backend,
-            parent=self._parent_backend,
-            field="backend",
-        )
-        compute_backend = self._resolve_bounded_value(
-            request.compute_backend,
-            parent=self._parent_compute_backend,
-            field="compute_backend",
-            parent_auto_is_open=True,
-        )
-        if (
-            compute_backend.lower().startswith(("cuda", "gpu", "mps", "xpu", "tpu"))
-            and self._total_gpus <= 0
-            and not self._device_tokens
-        ):
-            raise ProjectConfigurationError(
-                f"child Case compute_backend='{compute_backend}' requires an accelerator "
-                "outside the parent grant"
-            )
-        requested_capabilities = set(str(item) for item in request.capabilities)
-        if not requested_capabilities.issubset(self._parent_capabilities):
-            missing = sorted(requested_capabilities.difference(self._parent_capabilities))
-            raise ProjectConfigurationError(
-                "child Case requests capabilities outside the parent grant: "
-                f"{missing}"
-            )
-
-        requested_device = str(request.device or "auto").strip()
-        if requested_device.lower() in {"", "auto", "any", "none"}:
-            device = self._parent_device
-        elif requested_device.lower() == "cpu":
-            device = "cpu"
-        else:
-            parent_device = self._parent_device.lower()
-            token_match = requested_device in self._device_tokens
-            accelerator_parent = (
-                self._total_gpus > 0
-                or bool(self._device_tokens)
-                or parent_device.startswith(("cuda", "gpu", "mps", "xpu", "tpu"))
-            )
-            if not accelerator_parent or (
-                ":" in requested_device
-                and not token_match
-                and requested_device.lower() != parent_device
-            ):
-                raise ProjectConfigurationError(
-                    f"child Case device '{requested_device}' is outside parent device grant "
-                    f"'{self._parent_device}'"
+            with self._pool.acquire(
+                request,
+                scope="nested_case",
+                namespace_suffix=f"child.{identity.case_run_id}",
+                checkpoint=checkpoint,
+                deadline_at=control.deadline_at,
+                metadata={
+                    "parent_case_run_id": self.parent_request.identity.case_run_id,
+                    "run_identity": identity.as_dict(),
+                    "execution_control": control.as_dict(),
+                    "resource_request": request.as_dict(),
+                },
+            ) as subgrant:
+                yield ChildResourceGrant(
+                    grant_id=subgrant.grant_id,
+                    parent_lease_id=str(parent_lease.get("lease_id", "")),
+                    parent_case_run_id=self.parent_request.identity.case_run_id,
+                    namespace=subgrant.resource_context.namespace,
+                    resources=subgrant.resources,
+                    fencing_token=int(parent_lease.get("fencing_token", 0) or 0),
+                    metadata={
+                        "resource_request": request.as_dict(),
+                        "resource_subgrant": subgrant.as_dict(),
+                    },
                 )
-            device = requested_device
-        return backend, compute_backend, device
-
-    @staticmethod
-    def _resolve_bounded_value(
-        requested: str,
-        *,
-        parent: str,
-        field: str,
-        parent_auto_is_open: bool = False,
-    ) -> str:
-        child_value = str(requested or "auto").strip()
-        parent_value = str(parent or "auto").strip()
-        if child_value.lower() in {"", "auto", "any", "none"}:
-            return parent_value
-        if child_value.lower() == parent_value.lower():
-            return child_value
-        if parent_auto_is_open and parent_value.lower() in {"", "auto", "any", "none"}:
-            return child_value
-        raise ProjectConfigurationError(
-            f"child Case {field}='{child_value}' is outside parent grant "
-            f"'{parent_value}'"
-        )
+        except ResourceSubgrantError as exc:
+            raise ProjectConfigurationError(str(exc)) from exc
 
     def audit(self) -> dict[str, Any]:
-        with self._condition:
-            return {
-                "total_workers": self._total_workers,
-                "available_workers": self._available_workers,
-                "total_threads": self._total_threads,
-                "available_threads": self._available_threads,
-                "total_gpus": self._total_gpus,
-                "available_gpus": self._available_gpus,
-                "total_memory_mb": self._total_memory_mb,
-                "available_memory_mb": self._available_memory_mb,
-                "total_gpu_memory_mb": self._total_gpu_memory_mb,
-                "available_gpu_memory_mb": self._available_gpu_memory_mb,
-                "parent_backend": self._parent_backend,
-                "parent_compute_backend": self._parent_compute_backend,
-                "parent_device": self._parent_device,
-                "parent_capabilities": list(self._parent_capabilities),
-                "active_grants": [item.as_dict() for item in self._active.values()],
-            }
+        return self._pool.audit()
 
 
 @dataclass
@@ -468,7 +237,7 @@ class CaseInvoker:
         self.executor = executor
         self.parent_request = parent_request
         self.cancellation_tokens = tuple(cancellation_tokens)
-        self._grants = _ChildGrantPool(parent_request)
+        self._grants = _CaseChildGrantAdapter(parent_request)
         self._records: list[dict[str, Any]] = []
         self._lock = RLock()
 

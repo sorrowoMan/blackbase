@@ -189,6 +189,7 @@ class SQLiteLeaseStore:
         return None if row is None else _lease_from_row(row)
 
     def update(self, lease: ResourceLease) -> None:
+        payload = lease.as_dict()
         with self._connect() as connection:
             updated = connection.execute(
                 """
@@ -201,13 +202,13 @@ class SQLiteLeaseStore:
                 (
                     lease.owner_id,
                     lease.scope,
-                    _dump_json(lease.resources),
+                    _dump_json(payload["resources"]),
                     lease.status,
                     lease.created_at,
                     lease.updated_at,
                     lease.expires_at,
                     lease.fencing_token,
-                    _dump_json(lease.metadata),
+                    _dump_json(payload["metadata"]),
                     self.namespace,
                     lease.lease_id,
                 ),
@@ -539,18 +540,19 @@ class RedisLeaseStore:
 
 
 def _lease_row_values(namespace: str, lease: ResourceLease) -> tuple[object, ...]:
+    payload = lease.as_dict()
     return (
         str(namespace),
         lease.lease_id,
         lease.owner_id,
         lease.scope,
-        _dump_json(lease.resources),
+        _dump_json(payload["resources"]),
         lease.status,
         float(lease.created_at),
         float(lease.updated_at),
         float(lease.expires_at),
         int(lease.fencing_token),
-        _dump_json(lease.metadata),
+        _dump_json(payload["metadata"]),
     )
 
 

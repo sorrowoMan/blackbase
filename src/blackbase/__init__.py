@@ -7,7 +7,7 @@ and kernel components shared between optimization and machine learning framework
 
 from __future__ import annotations
 
-__version__ = "0.3.6"
+__version__ = "0.3.8"
 
 from . import context
 from . import resources

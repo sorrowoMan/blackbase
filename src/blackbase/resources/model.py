@@ -15,6 +15,8 @@ from threading import RLock
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
+from blackbase.wire import freeze_wire_mapping, thaw_wire_mapping
+
 
 def _now_unix() -> float:
     """Get current Unix timestamp."""
@@ -43,6 +45,46 @@ def _as_float_or_none(value: Any) -> Optional[float]:
     return out
 
 
+def _device_family(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized.startswith(("cuda", "gpu")) or "gpu" in normalized:
+        return "gpu"
+    if normalized.startswith("mps"):
+        return "mps"
+    return "cpu" if normalized.startswith("cpu") else normalized
+
+
+def _is_accelerator_token(value: str) -> bool:
+    return _device_family(value) in {"gpu", "mps"}
+
+
+def _resolve_device_bindings(
+    request: "ResourceRequest",
+    offer: "ResourceOffer",
+) -> dict[str, str]:
+    metadata = thaw_wire_mapping(offer.metadata)
+    explicit = dict(
+        metadata.get("device_bindings", metadata.get("resolved_devices", {})) or {}
+    )
+    offered_tokens = tuple(str(item) for item in offer.device_tokens)
+    resolved: dict[str, str] = {}
+    for token in request.device_tokens:
+        physical = str(explicit.get(token, "") or "").strip()
+        if not physical and token.startswith(("cuda:", "gpu:")):
+            physical = "cuda:" + token.split(":", 1)[1]
+        elif not physical and token == "mps":
+            physical = "mps"
+        elif not physical and _is_accelerator_token(token) and int(offer.gpus) > 0:
+            accelerator_tokens = [
+                item for item in offered_tokens if _is_accelerator_token(item)
+            ]
+            if token in accelerator_tokens:
+                physical = f"cuda:{accelerator_tokens.index(token)}"
+        if physical:
+            resolved[str(token)] = physical
+    return resolved
+
+
 # ============================================================================
 # Data Reference
 # ============================================================================
@@ -65,14 +107,21 @@ class DataRef:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     
     def __post_init__(self) -> None:
-        object.__setattr__(self, "uri", str(self.uri))
+        uri = str(self.uri or "").strip()
+        if not uri:
+            raise ValueError("DataRef.uri must not be empty")
+        object.__setattr__(self, "uri", uri)
         object.__setattr__(self, "kind", str(self.kind or "artifact"))
         object.__setattr__(self, "backend", str(self.backend or "filesystem"))
         object.__setattr__(self, "media_type", str(self.media_type or ""))
         object.__setattr__(self, "checksum", str(self.checksum or ""))
         size = None if self.size_bytes is None else max(0, int(self.size_bytes))
         object.__setattr__(self, "size_bytes", size)
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="data_ref.metadata"),
+        )
     
     @classmethod
     def from_path(cls, path: str | Path, *, kind: str = "artifact", media_type: str = "") -> "DataRef":
@@ -103,7 +152,7 @@ class DataRef:
             "media_type": str(self.media_type),
             "checksum": str(self.checksum),
             "size_bytes": self.size_bytes,
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -127,10 +176,16 @@ class ResourceOffer:
     
     def __post_init__(self) -> None:
         object.__setattr__(self, "threads", max(1, int(self.threads)))
-        object.__setattr__(self, "gpus", max(0, int(self.gpus)))
+        tokens = tuple(str(x) for x in _as_tuple(self.device_tokens))
+        accelerator_count = sum(1 for token in tokens if _is_accelerator_token(token))
+        object.__setattr__(self, "gpus", max(0, int(self.gpus), accelerator_count))
         object.__setattr__(self, "backend", str(self.backend or "local"))
-        object.__setattr__(self, "device_tokens", tuple(str(x) for x in _as_tuple(self.device_tokens)))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "device_tokens", tokens)
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="resource_offer.metadata"),
+        )
     
     def as_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -139,7 +194,7 @@ class ResourceOffer:
             "gpus": int(self.gpus),
             "backend": str(self.backend),
             "device_tokens": [str(x) for x in self.device_tokens],
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -168,14 +223,20 @@ class ResourceRequirement:
     
     def __post_init__(self) -> None:
         object.__setattr__(self, "threads", max(1, int(self.threads)))
-        object.__setattr__(self, "gpus", max(0, int(self.gpus)))
+        tokens = tuple(str(x) for x in _as_tuple(self.device_tokens))
+        accelerator_count = sum(1 for token in tokens if _is_accelerator_token(token))
+        object.__setattr__(self, "gpus", max(0, int(self.gpus), accelerator_count))
         object.__setattr__(self, "resource_backend", str(self.resource_backend or "local"))
-        object.__setattr__(self, "device_tokens", tuple(str(x) for x in _as_tuple(self.device_tokens)))
+        object.__setattr__(self, "device_tokens", tokens)
         object.__setattr__(self, "memory_mb", _as_float_or_none(self.memory_mb))
         object.__setattr__(self, "gpu_memory_mb", _as_float_or_none(self.gpu_memory_mb))
         object.__setattr__(self, "capabilities", tuple(str(x) for x in _as_tuple(self.capabilities) if str(x)))
         object.__setattr__(self, "timeout_seconds", _as_float_or_none(self.timeout_seconds))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="resource_requirement.metadata"),
+        )
     
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ResourceRequirement":
@@ -203,7 +264,7 @@ class ResourceRequirement:
             "gpu_memory_mb": self.gpu_memory_mb,
             "capabilities": [str(x) for x in self.capabilities],
             "timeout_seconds": self.timeout_seconds,
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
     def to_resource_request(self, *, label: str = "") -> "ResourceRequest":
@@ -232,8 +293,8 @@ class ResourceRequirement:
             return False
         if self.device_tokens:
             offered = set(str(x) for x in offer.device_tokens)
-            concrete = {x for x in self.device_tokens if ":" in str(x) or str(x) == "mps"}
-            if not concrete.issubset(offered):
+            requested = set(str(x) for x in self.device_tokens)
+            if not requested.issubset(offered):
                 return False
         if self.memory_mb is not None:
             available = dict(offer.metadata or {}).get("memory_mb")
@@ -281,7 +342,11 @@ class WorkerDescriptor:
         object.__setattr__(self, "max_inflight", max(1, int(self.max_inflight)))
         object.__setattr__(self, "status", str(self.status or "online"))
         object.__setattr__(self, "last_heartbeat_at", float(self.last_heartbeat_at or _now_unix()))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="worker.metadata"),
+        )
     
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "WorkerDescriptor":
@@ -355,7 +420,7 @@ class WorkerDescriptor:
             "max_inflight": int(self.max_inflight),
             "status": str(self.status),
             "last_heartbeat_at": float(self.last_heartbeat_at),
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -389,7 +454,11 @@ class TaskEnvelope:
         req = self.requirement if isinstance(self.requirement, ResourceRequirement) else ResourceRequirement.from_dict(self.requirement)
         object.__setattr__(self, "task_id", str(self.task_id or f"task_{uuid4().hex[:16]}"))
         object.__setattr__(self, "task_type", str(self.task_type or "task"))
-        object.__setattr__(self, "payload", dict(self.payload or {}))
+        object.__setattr__(
+            self,
+            "payload",
+            freeze_wire_mapping(self.payload, path="task.payload"),
+        )
         object.__setattr__(self, "requirement", req)
         object.__setattr__(self, "executor_backend", str(self.executor_backend or "auto"))
         object.__setattr__(self, "input_refs", tuple(_coerce_data_ref(x) for x in _as_tuple(self.input_refs)))
@@ -399,7 +468,11 @@ class TaskEnvelope:
         object.__setattr__(self, "namespace", str(self.namespace or "default"))
         object.__setattr__(self, "max_retries", max(0, int(self.max_retries)))
         object.__setattr__(self, "created_at", float(self.created_at or _now_unix()))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="task.metadata"),
+        )
     
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "TaskEnvelope":
@@ -425,7 +498,7 @@ class TaskEnvelope:
         return {
             "task_id": str(self.task_id),
             "task_type": str(self.task_type),
-            "payload": dict(self.payload),
+            "payload": thaw_wire_mapping(self.payload),
             "requirement": self.requirement.as_dict(),
             "executor_backend": str(self.executor_backend),
             "input_refs": [x.as_dict() for x in self.input_refs],
@@ -435,7 +508,7 @@ class TaskEnvelope:
             "namespace": str(self.namespace),
             "max_retries": int(self.max_retries),
             "created_at": float(self.created_at),
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -473,16 +546,35 @@ class TaskResult:
         object.__setattr__(self, "status", str(self.status or "ok"))
         object.__setattr__(self, "objectives", tuple(float(x) for x in _as_tuple(self.objectives)))
         object.__setattr__(self, "violations", tuple(float(x) for x in _as_tuple(self.violations)))
-        object.__setattr__(self, "metrics", dict(self.metrics or {}))
-        object.__setattr__(self, "output", dict(self.output or {}))
+        object.__setattr__(
+            self,
+            "metrics",
+            freeze_wire_mapping(self.metrics, path="task_result.metrics"),
+        )
+        object.__setattr__(
+            self,
+            "output",
+            freeze_wire_mapping(self.output, path="task_result.output"),
+        )
         object.__setattr__(self, "artifact_refs", tuple(_coerce_data_ref(x) for x in _as_tuple(self.artifact_refs)))
         object.__setattr__(self, "worker_id", str(self.worker_id or ""))
         object.__setattr__(self, "lease_id", str(self.lease_id or ""))
-        object.__setattr__(self, "resource_context", dict(self.resource_context or {}))
+        object.__setattr__(
+            self,
+            "resource_context",
+            freeze_wire_mapping(
+                self.resource_context,
+                path="task_result.resource_context",
+            ),
+        )
         object.__setattr__(self, "error", str(self.error or ""))
         object.__setattr__(self, "started_at", started)
         object.__setattr__(self, "finished_at", finished)
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="task_result.metadata"),
+        )
     
     @property
     def ok(self) -> bool:
@@ -573,17 +665,17 @@ class TaskResult:
             "ok": bool(self.ok),
             "objectives": [float(x) for x in self.objectives],
             "violations": [float(x) for x in self.violations],
-            "metrics": dict(self.metrics),
-            "output": dict(self.output),
+            "metrics": thaw_wire_mapping(self.metrics),
+            "output": thaw_wire_mapping(self.output),
             "artifact_refs": [x.as_dict() for x in self.artifact_refs],
             "worker_id": str(self.worker_id),
             "lease_id": str(self.lease_id),
-            "resource_context": dict(self.resource_context),
+            "resource_context": thaw_wire_mapping(self.resource_context),
             "error": str(self.error),
             "started_at": float(self.started_at),
             "finished_at": float(self.finished_at),
             "duration_seconds": self.duration_seconds,
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -610,7 +702,14 @@ class ScheduledTask:
         if self.lease is not None:
             lease_id = self.lease.lease_id
         object.__setattr__(self, "lease_id", str(lease_id or ""))
-        object.__setattr__(self, "resource_context", dict(self.resource_context or {}))
+        object.__setattr__(
+            self,
+            "resource_context",
+            freeze_wire_mapping(
+                self.resource_context,
+                path="scheduled_task.resource_context",
+            ),
+        )
     
     def as_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -619,7 +718,7 @@ class ScheduledTask:
             "worker": self.worker.as_dict(),
             "lease_id": str(self.lease_id),
             "lease": None if self.lease is None else self.lease.as_dict(),
-            "resource_context": dict(self.resource_context),
+            "resource_context": thaw_wire_mapping(self.resource_context),
         }
 
 
@@ -648,15 +747,25 @@ class ResourceRequest:
         threads = workers if self.threads is None else max(1, int(self.threads or 1))
         object.__setattr__(self, "workers", workers)
         object.__setattr__(self, "threads", threads)
-        object.__setattr__(self, "gpus", max(0, int(self.gpus or 0)))
+        tokens = tuple(str(x) for x in _as_tuple(self.device_tokens))
+        accelerator_count = sum(1 for token in tokens if _is_accelerator_token(token))
+        object.__setattr__(
+            self,
+            "gpus",
+            max(0, int(self.gpus or 0), accelerator_count),
+        )
         object.__setattr__(self, "memory_mb", _as_float_or_none(self.memory_mb))
         object.__setattr__(self, "gpu_memory_mb", _as_float_or_none(self.gpu_memory_mb))
         object.__setattr__(self, "backend", str(self.backend or "local"))
         object.__setattr__(self, "compute_backend", str(self.compute_backend or "auto"))
         object.__setattr__(self, "device", str(self.device or "cpu"))
-        object.__setattr__(self, "device_tokens", tuple(str(x) for x in _as_tuple(self.device_tokens)))
+        object.__setattr__(self, "device_tokens", tokens)
         object.__setattr__(self, "capabilities", tuple(str(x) for x in _as_tuple(self.capabilities) if str(x)))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="resource_request.metadata"),
+        )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any] | None) -> "ResourceRequest":
@@ -684,7 +793,7 @@ class ResourceRequest:
             memory_mb=self.memory_mb,
             gpu_memory_mb=self.gpu_memory_mb,
             capabilities=tuple(self.capabilities),
-            metadata=dict(self.metadata),
+            metadata=thaw_wire_mapping(self.metadata),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -699,7 +808,7 @@ class ResourceRequest:
             "device": str(self.device),
             "device_tokens": [str(x) for x in self.device_tokens],
             "capabilities": [str(x) for x in self.capabilities],
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
@@ -726,7 +835,11 @@ class ResourcePolicy:
         object.__setattr__(self, "mode", str(self.mode or "strict"))
         object.__setattr__(self, "gpu_sharing", str(self.gpu_sharing or "exclusive"))
         object.__setattr__(self, "cpu_oversubscribe", bool(self.cpu_oversubscribe))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(self.metadata, path="resource_policy.metadata"),
+        )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any] | None) -> "ResourcePolicy":
@@ -751,11 +864,11 @@ class ResourcePolicy:
             "mode": str(self.mode),
             "gpu_sharing": str(self.gpu_sharing),
             "cpu_oversubscribe": bool(self.cpu_oversubscribe),
-            "metadata": dict(self.metadata),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ResourceLease:
     """Lease issued by the Project L0 substrate."""
 
@@ -771,16 +884,43 @@ class ResourceLease:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.lease_id = str(self.lease_id)
-        self.owner_id = str(self.owner_id or "")
-        self.scope = str(self.scope or "")
-        self.resources = dict(self.resources or {})
-        self.status = str(self.status or "active")
-        self.created_at = float(self.created_at or _now_unix())
-        self.updated_at = float(self.updated_at or self.created_at)
-        self.expires_at = max(0.0, float(self.expires_at or 0.0))
-        self.fencing_token = max(0, int(self.fencing_token or 0))
-        self.metadata = dict(self.metadata or {})
+        created_at = float(self.created_at or _now_unix())
+        object.__setattr__(self, "lease_id", str(self.lease_id))
+        object.__setattr__(self, "owner_id", str(self.owner_id or ""))
+        object.__setattr__(self, "scope", str(self.scope or ""))
+        object.__setattr__(
+            self,
+            "resources",
+            freeze_wire_mapping(
+                self.resources,
+                path="resource_lease.resources",
+            ),
+        )
+        object.__setattr__(self, "status", str(self.status or "active"))
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(
+            self,
+            "updated_at",
+            float(self.updated_at or created_at),
+        )
+        object.__setattr__(
+            self,
+            "expires_at",
+            max(0.0, float(self.expires_at or 0.0)),
+        )
+        object.__setattr__(
+            self,
+            "fencing_token",
+            max(0, int(self.fencing_token or 0)),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            freeze_wire_mapping(
+                self.metadata,
+                path="resource_lease.metadata",
+            ),
+        )
 
     @property
     def active(self) -> bool:
@@ -802,6 +942,7 @@ class ResourceLease:
 
     def resource_context(self, **kwargs: Any) -> Dict[str, Any]:
         resources = dict(self.resources or {})
+        resolved_devices = dict(resources.get("resolved_devices", {}) or {})
         grant = {
             "backend": resources.get("backend", "local"),
             "threads": int(resources.get("threads", resources.get("workers", 1)) or 1),
@@ -811,6 +952,7 @@ class ResourceLease:
             "gpu_memory_mb": resources.get("gpu_memory_mb"),
             "device": resources.get("device", "cpu"),
             "device_tokens": list(resources.get("device_tokens", ()) or ()),
+            "resolved_devices": resolved_devices,
             "capabilities": list(resources.get("capabilities", ()) or ()),
             "compute_backend": resources.get("compute_backend", kwargs.get("compute_backend", "auto")),
             "fencing_token": int(self.fencing_token),
@@ -839,13 +981,13 @@ class ResourceLease:
             "lease_id": str(self.lease_id),
             "owner_id": str(self.owner_id),
             "scope": str(self.scope),
-            "resources": dict(self.resources),
+            "resources": thaw_wire_mapping(self.resources),
             "status": str(self.status),
             "created_at": float(self.created_at),
             "updated_at": float(self.updated_at),
             "expires_at": float(self.expires_at),
             "fencing_token": int(self.fencing_token),
-            "metadata": dict(self.metadata or {}),
+            "metadata": thaw_wire_mapping(self.metadata),
         }
 
     @classmethod
@@ -1011,12 +1153,19 @@ class ResourceAllocator:
         with self._lock:
             if str(self.policy.mode).lower() == "strict":
                 self._validate_request(req)
+            resources = req.as_dict()
+            resolved_devices = _resolve_device_bindings(req, self.offer)
+            if resolved_devices:
+                resources["resolved_devices"] = resolved_devices
+                current_device = str(resources.get("device", "cpu") or "cpu").lower()
+                if current_device in {"", "auto", "none", "cpu"}:
+                    resources["device"] = next(iter(resolved_devices.values()))
             lease_id = f"lease-{owner_id or 'case'}-{scope or 'project'}-{uuid4().hex[:12]}"
             lease = ResourceLease(
                 lease_id=lease_id,
                 owner_id=str(owner_id or ""),
                 scope=str(scope or ""),
-                resources=req.as_dict(),
+                resources=resources,
                 metadata={"source": "blackbase.project.l0"},
             )
             acquire_lease = getattr(self.lease_store, "acquire_lease", None)
