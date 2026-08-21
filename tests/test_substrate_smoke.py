@@ -227,6 +227,10 @@ def test_project_substrate_add_case_runner_and_doctor(tmp_path) -> None:
         '    raise SystemExit(main())\n'
     )
     for case_root in (solver_case, trainer_case):
+        readme = case_root / "README.md"
+        assert readme.is_file()
+        assert "build_solver.py" in readme.read_text(encoding="utf-8")
+        assert not (case_root / "START_HERE.md").exists()
         assert (case_root / "build_trainer.py").read_text(encoding="utf-8") == expected_build_alias
         assert (case_root / "run_trainer.py").read_text(encoding="utf-8") == expected_run_alias
         run_source = (case_root / "run_solver.py").read_text(encoding="utf-8")

@@ -211,10 +211,40 @@ def _normalize_case_scaffold(case_path: Path, *, case_name: str, case_kind: str,
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "__init__.py").touch()
     _write_case_marker(case_path, case_name=case_name, kind=case_kind, framework=framework)
+    _ensure_case_readme(
+        case_path,
+        case_name=case_name,
+        case_kind=case_kind,
+        framework=framework,
+    )
     _ensure_pipeline_entry(case_path, case_kind=case_kind)
     _ensure_primary_entries(case_path, case_kind=case_kind, framework=framework)
     if not (case_path / "config.py").is_file():
         (case_path / "config.py").write_text(_case_config_template(), encoding="utf-8")
+
+
+def _ensure_case_readme(
+    case_path: Path,
+    *,
+    case_name: str,
+    case_kind: str,
+    framework: str,
+) -> None:
+    """Create the one canonical documentation entry for a Case."""
+
+    readme = case_path / "README.md"
+    if readme.is_file():
+        return
+    readme.write_text(
+        f"# {case_name}\n\n"
+        f"- 语义类型：`{case_kind}`\n"
+        f"- 语义框架：`{framework}`\n"
+        "- 规范装配入口：`build_solver.py`\n"
+        "- 独立运行入口：`run_solver.py`\n\n"
+        "组件边界、资源请求、输入输出与运行方式都应维护在本文件中；"
+        "不要再创建 START_HERE、注册指南或复制的契约模板。\n",
+        encoding="utf-8",
+    )
 
 
 def _ensure_pipeline_entry(case_path: Path, *, case_kind: str) -> None:
