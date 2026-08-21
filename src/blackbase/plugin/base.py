@@ -93,6 +93,15 @@ class PluginBase(ABC):
 
     # --- Lifecycle hooks (all optional) ---
 
+    def prepare_restore(self, solver):
+        """Resolve and queue a restore envelope after setup, before init hooks.
+
+        Implementations must not mutate live Solver state directly.  They may
+        validate/load external state and queue exactly one restore transaction
+        through the Solver's restore-envelope surface.
+        """
+        return None
+
     def on_solver_init(self, solver):
         """Called when the solver/trainer starts. (nsgablack: on_solver_init, mlblack: on_fit_start)"""
         return None
@@ -457,6 +466,51 @@ class PluginManager:
         if is_context_build:
             return current_context
         return out
+
+    def prepare_restore(self, solver):
+        """Collect restore requests before any ordinary init hook observes state."""
+        self._solver = solver
+        for plugin in self.plugins:
+            if not plugin.enabled or bool(getattr(plugin, "_attach_failed", False)):
+                continue
+            try:
+                if getattr(plugin, "solver", None) is not solver:
+                    plugin.attach(solver)
+            except Exception as exc:
+                plugin._attach_failed = True
+                plugin._attach_error = str(exc)
+                if bool(getattr(solver, "plugin_strict", False)):
+                    raise
+                report_soft_error(
+                    component="PluginManager",
+                    event="prepare_restore.attach",
+                    exc=exc,
+                    logger=logger,
+                    strict=False,
+                    level="warning",
+                )
+                continue
+            try:
+                plugin.prepare_restore(solver)
+            except Exception as exc:
+                strict_restore = bool(
+                    getattr(plugin, "raise_on_restore_error", False)
+                ) or bool(getattr(plugin, "raise_on_init_error", False))
+                if strict_restore or bool(getattr(solver, "plugin_strict", False)):
+                    raise
+                warnings.warn(
+                    f"Plugin '{plugin.name}' restore preparation failed: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                report_soft_error(
+                    component="PluginManager",
+                    event="prepare_restore.hook",
+                    exc=exc,
+                    logger=logger,
+                    strict=False,
+                    level="warning",
+                )
 
     def on_solver_init(self, solver):
         """Notify all plugins that solver init has started."""

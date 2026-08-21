@@ -6,15 +6,17 @@ Trainer and therefore remains independent of downstream semantic frameworks.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import CancelledError, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
 
-from blackbase.resources import DataRef
+from blackbase.resources import CancellationRef, CancellationToken, DataRef
 
 from .execution import (
     CaseRunRequest,
     CaseRunResult,
+    CaseFailure,
     ExecutionControl,
     ProjectConfigurationError,
 )
@@ -27,7 +29,14 @@ class CaseInvocationRuntime(Protocol):
 
     def checkpoint(self) -> None: ...
 
-    def invoke(self, request: CaseRunRequest) -> CaseRunResult: ...
+    def invoke(
+        self,
+        request: CaseRunRequest,
+        *,
+        intermediate_cancellations: Sequence[CancellationRef] = (),
+    ) -> CaseRunResult: ...
+
+    def cancellation_token(self, ref: CancellationRef) -> CancellationToken: ...
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,7 @@ class CaseStage:
     policy: str = "serial"
     failure_policy: str = "fail_fast"
     max_workers: int = 0
+    cancellation_grace_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         name = str(self.name or "").strip()
@@ -145,11 +155,15 @@ class CaseStage:
             raise ValueError("Case stage policy must be 'serial' or 'parallel'")
         if failure not in {"fail_fast", "continue"}:
             raise ValueError("Case stage failure_policy must be 'fail_fast' or 'continue'")
+        grace = float(self.cancellation_grace_seconds)
+        if grace < 0:
+            raise ValueError("Case stage cancellation_grace_seconds must be non-negative")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "calls", calls)
         object.__setattr__(self, "policy", policy)
         object.__setattr__(self, "failure_policy", failure)
         object.__setattr__(self, "max_workers", max(0, int(self.max_workers or 0)))
+        object.__setattr__(self, "cancellation_grace_seconds", grace)
 
 
 @dataclass(frozen=True)
@@ -160,6 +174,8 @@ class CaseStageResult:
     results: Mapping[str, CaseRunResult]
     artifact_refs: Mapping[str, DataRef]
     stopped_early: bool = False
+    cancelled_calls: tuple[str, ...] = ()
+    still_running_calls: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -170,6 +186,8 @@ class CaseStageResult:
             "stage_name": self.stage_name,
             "ok": self.ok,
             "stopped_early": self.stopped_early,
+            "cancelled_calls": list(self.cancelled_calls),
+            "still_running_calls": list(self.still_running_calls),
             "results": {name: result.as_dict() for name, result in self.results.items()},
             "artifact_refs": {name: ref.as_dict() for name, ref in self.artifact_refs.items()},
         }
@@ -240,19 +258,156 @@ class CaseStageRunner:
         snapshot = dict(self._artifacts)
         workers = stage.max_workers or len(stage.calls)
         results: dict[str, CaseRunResult] = {}
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(stage.calls)))) as pool:
-            futures = {
-                pool.submit(self._invoke, stage, call, snapshot): call
-                for call in stage.calls
-            }
-            for future in as_completed(futures):
+        requests = {
+            call.name: call.build_request(
+                self.runtime,
+                stage_name=stage.name,
+                artifacts=snapshot,
+            )
+            for call in stage.calls
+        }
+        parent_ref = self.runtime.request.control.cancellation
+        stage_ref = CancellationRef(
+            backend=parent_ref.backend,
+            namespace=parent_ref.namespace,
+            path=parent_ref.path,
+            redis_url_env=parent_ref.redis_url_env,
+        )
+        stage_token = self.runtime.cancellation_token(stage_ref)
+        pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(stage.calls))))
+        futures: dict[Future[CaseRunResult], ChildCaseCall] = {
+            pool.submit(
+                self._invoke_request,
+                requests[call.name],
+                (stage_ref,),
+            ): call
+            for call in stage.calls
+        }
+        pending = set(futures)
+        stopped = False
+        cancellation_deadline: float | None = None
+        try:
+            while pending:
+                timeout = None
+                if cancellation_deadline is not None:
+                    timeout = max(0.0, cancellation_deadline - time.monotonic())
+                done, _not_done = wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                pending.difference_update(done)
+                for future in done:
+                    call = futures[future]
+                    result = self._future_result(call, requests[call.name], future)
+                    results[call.name] = result
+                    if (
+                        not result.ok
+                        and stage.failure_policy == "fail_fast"
+                        and not stopped
+                    ):
+                        stopped = True
+                        stage_token.cancel(
+                            f"parallel stage '{stage.name}' failed at child '{call.name}'"
+                        )
+                        for sibling in pending:
+                            sibling.cancel()
+                        cancellation_deadline = (
+                            time.monotonic() + stage.cancellation_grace_seconds
+                        )
+        finally:
+            cancelled: list[str] = []
+            still_running: list[str] = []
+            for future in tuple(pending):
                 call = futures[future]
-                result = future.result()
-                results[call.name] = result
+                request = requests[call.name]
+                if future.cancelled():
+                    cancelled.append(call.name)
+                    results[call.name] = self._cancelled_result(
+                        request,
+                        kind="stage_cancelled_before_start",
+                        message="child Case was cancelled before execution",
+                    )
+                elif future.done():
+                    results[call.name] = self._future_result(call, request, future)
+                else:
+                    still_running.append(call.name)
+                    results[call.name] = CaseRunResult(
+                        request=request,
+                        status="running",
+                        metadata={
+                            "stage_cancel_requested": True,
+                            "still_running_after_grace": True,
+                        },
+                    )
+            pool.shutdown(wait=not still_running, cancel_futures=True)
         for call in stage.calls:
-            self._merge_artifacts(call, results[call.name])
+            result = results[call.name]
+            if result.ok:
+                self._merge_artifacts(call, result)
         ordered = {call.name: results[call.name] for call in stage.calls}
-        return CaseStageResult(stage.name, ordered, dict(self._artifacts), False)
+        cancelled_set = set(cancelled)
+        still_running_set = set(still_running)
+        return CaseStageResult(
+            stage.name,
+            ordered,
+            dict(self._artifacts),
+            stopped,
+            tuple(call.name for call in stage.calls if call.name in cancelled_set),
+            tuple(
+                call.name for call in stage.calls
+                if call.name in still_running_set
+            ),
+        )
+
+    @staticmethod
+    def _cancelled_result(
+        request: CaseRunRequest,
+        *,
+        kind: str,
+        message: str,
+    ) -> CaseRunResult:
+        now = time.time()
+        return CaseRunResult(
+            request=request,
+            status="cancelled",
+            started_at=now,
+            finished_at=now,
+            exit_code=1,
+            failure=CaseFailure(kind=kind, message=message),
+        )
+
+    @classmethod
+    def _future_result(
+        cls,
+        call: ChildCaseCall,
+        request: CaseRunRequest,
+        future: Future[CaseRunResult],
+    ) -> CaseRunResult:
+        try:
+            return future.result()
+        except CancelledError:
+            return cls._cancelled_result(
+                request,
+                kind="stage_cancelled_before_start",
+                message="child Case was cancelled before execution",
+            )
+        except BaseException as exc:
+            now = time.time()
+            return CaseRunResult(
+                request=request,
+                status="failed",
+                started_at=now,
+                finished_at=now,
+                exit_code=1,
+                failure=CaseFailure(
+                    kind="stage_child_exception",
+                    message=f"child Case '{call.name}' raised outside its result envelope",
+                    cause={"type": type(exc).__name__, "message": str(exc)},
+                ),
+            )
 
     def _invoke(
         self,
@@ -265,7 +420,19 @@ class CaseStageRunner:
             stage_name=stage.name,
             artifacts=artifacts,
         )
-        return self.runtime.invoke(request)
+        return self._invoke_request(request)
+
+    def _invoke_request(
+        self,
+        request: CaseRunRequest,
+        intermediate_cancellations: Sequence[CancellationRef] = (),
+    ) -> CaseRunResult:
+        if not intermediate_cancellations:
+            return self.runtime.invoke(request)
+        return self.runtime.invoke(
+            request,
+            intermediate_cancellations=intermediate_cancellations,
+        )
 
     def _merge_artifacts(self, call: ChildCaseCall, result: CaseRunResult) -> None:
         for name, ref in result.artifact_refs.items():

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import threading
+import time
 
 from blackbase.project import (
     CaseRunRequest,
@@ -9,7 +11,7 @@ from blackbase.project import (
     CaseStageRunner,
     ChildCaseCall,
 )
-from blackbase.resources import DataRef
+from blackbase.resources import CancellationRef, CancellationToken, DataRef
 
 
 class _Runtime:
@@ -26,7 +28,13 @@ class _Runtime:
     def checkpoint(self) -> None:
         self.checkpoints += 1
 
-    def invoke(self, request: CaseRunRequest) -> CaseRunResult:
+    def invoke(
+        self,
+        request: CaseRunRequest,
+        *,
+        intermediate_cancellations=(),
+    ) -> CaseRunResult:
+        del intermediate_cancellations
         self.requests.append(request)
         ref = DataRef(uri=f"memory://{request.case_name}", kind="artifact", backend="memory")
         return CaseRunResult(
@@ -35,6 +43,9 @@ class _Runtime:
             artifact_refs={"model": ref},
             output={"case": request.case_name},
         )
+
+    def cancellation_token(self, ref: CancellationRef) -> CancellationToken:
+        return CancellationToken(ref)
 
 
 def test_case_stage_routes_artifacts_through_complete_child_requests() -> None:
@@ -69,7 +80,8 @@ def test_case_stage_routes_artifacts_through_complete_child_requests() -> None:
 def test_parallel_stage_retains_structured_failure_without_fabricating_output() -> None:
     runtime = _Runtime()
 
-    def invoke(request: CaseRunRequest) -> CaseRunResult:
+    def invoke(request: CaseRunRequest, *, intermediate_cancellations=()) -> CaseRunResult:
+        del intermediate_cancellations
         runtime.requests.append(request)
         if request.case_name == "bad":
             return CaseRunResult(request=request, status="failed", exit_code=1)
@@ -91,3 +103,57 @@ def test_parallel_stage_retains_structured_failure_without_fabricating_output() 
     assert not result.ok
     assert result.results["bad"].status == "failed"
     assert result.results["bad"].output == {}
+
+
+def test_parallel_fail_fast_cancels_running_and_pending_siblings() -> None:
+    runtime = _Runtime()
+    slow_started = threading.Event()
+
+    def invoke(request: CaseRunRequest, *, intermediate_cancellations=()) -> CaseRunResult:
+        runtime.requests.append(request)
+        if request.case_name == "bad":
+            assert slow_started.wait(timeout=1.0)
+            return CaseRunResult(request=request, status="failed", exit_code=1)
+        token = runtime.cancellation_token(intermediate_cancellations[-1])
+        if request.case_name == "slow":
+            slow_started.set()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if token.cancelled:
+                    return CaseRunResult(request=request, status="cancelled", exit_code=1)
+                time.sleep(0.005)
+        if request.case_name == "queued":
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if token.cancelled:
+                    return CaseRunResult(request=request, status="cancelled", exit_code=1)
+                time.sleep(0.005)
+        return CaseRunResult(request=request, status="succeeded")
+
+    runtime.invoke = invoke  # type: ignore[method-assign]
+    started_at = time.monotonic()
+    result = CaseStageRunner(
+        runtime,
+        (
+            CaseStage(
+                "parallel",
+                (
+                    ChildCaseCall("bad", "bad"),
+                    ChildCaseCall("slow", "slow"),
+                    ChildCaseCall("queued", "queued"),
+                ),
+                policy="parallel",
+                failure_policy="fail_fast",
+                max_workers=2,
+                cancellation_grace_seconds=0.5,
+            ),
+        ),
+    ).run()[0]
+
+    assert time.monotonic() - started_at < 0.9
+    assert result.stopped_early is True
+    assert result.results["bad"].status == "failed"
+    assert result.results["slow"].status == "cancelled"
+    assert result.results["queued"].status == "cancelled"
+    assert set(result.cancelled_calls).issubset({"queued"})
+    assert result.still_running_calls == ()

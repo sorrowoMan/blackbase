@@ -2,7 +2,7 @@
 
 `blackbase` 是 `nsgablack` 与 `mlblack` 共享的运行底座。它不实现优化算法、模型训练方法或领域目标，只提供两种语义层共同依赖的协议与工程闭环。
 
-当前版本：`0.3.8`。
+当前版本：`0.3.9`。
 
 ## 职责
 
@@ -60,6 +60,10 @@ case/
 - 结构化失败和可传输结果
 
 协作式取消适用于可检查 checkpoint 的代码；不可中断的原生调用必须放进可监督的隔离进程，才能升级为 terminate / kill。
+
+并行 Stage 的 `fail_fast` 会建立独立的 stage cancellation lineage：首个失败出现后停止未开始任务、通知运行中的兄弟 Case，并在有界 grace 后把仍未退出的调用记录为 `still_running_calls`，不会无限等待后才声称 fail-fast。
+
+共享 Plugin 生命周期在普通初始化前提供 `prepare_restore`。该阶段只负责加载、验证并排队 restore envelope；语义框架在 setup 后原子应用恢复状态，之后才触发 `on_solver_init`，从而保证普通插件不会观察到“setup 已完成但 checkpoint 尚未恢复”的中间态。
 
 ## 状态边界
 

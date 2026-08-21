@@ -84,11 +84,26 @@ class CaseRuntimeContext:
     def cancel(self, reason: str = "cancelled by Case") -> bool:
         return self.cancellation_tokens[-1].cancel(reason)
 
-    def invoke(self, request: CaseRunRequest) -> CaseRunResult:
+    def invoke(
+        self,
+        request: CaseRunRequest,
+        *,
+        intermediate_cancellations: Sequence[CancellationRef] = (),
+    ) -> CaseRunResult:
         self.checkpoint()
-        result = self.invoker.invoke(request)
+        result = self.invoker.invoke(
+            request,
+            intermediate_cancellations=intermediate_cancellations,
+        )
         self.checkpoint()
         return result
+
+    def cancellation_token(self, ref: CancellationRef) -> CancellationToken:
+        """Create a runtime token for a parent-authorized intermediate scope."""
+
+        if not isinstance(ref, CancellationRef):
+            raise TypeError("cancellation_token requires a CancellationRef")
+        return CancellationToken(ref, redis_client=self.invoker.executor.redis_client)
 
     @property
     def artifact_refs(self) -> Mapping[str, DataRef]:
@@ -245,13 +260,21 @@ class CaseInvoker:
         for token in self.cancellation_tokens:
             token.checkpoint()
 
-    def invoke(self, request: CaseRunRequest) -> CaseRunResult:
+    def invoke(
+        self,
+        request: CaseRunRequest,
+        *,
+        intermediate_cancellations: Sequence[CancellationRef] = (),
+    ) -> CaseRunResult:
         started_at = time.time()
         # A request object may be submitted repeatedly.  Its default identity is
         # only a request-side placeholder; each actual child execution gets a
         # fresh invocation and Case-run namespace.
         fallback_identity = self.parent_request.identity.child()
-        child_control = self.parent_request.control.derive_child(request.control)
+        child_control = self.parent_request.control.derive_child(
+            request.control,
+            intermediate_cancellations=intermediate_cancellations,
+        )
         prepared = replace(request, identity=fallback_identity, control=child_control)
         try:
             if request.project_name != self.parent_request.project_name:

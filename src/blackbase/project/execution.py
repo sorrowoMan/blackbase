@@ -195,6 +195,8 @@ class ExecutionControl:
     def derive_child(
         self,
         child: "ExecutionControl | CancellationRef",
+        *,
+        intermediate_cancellations: Sequence[CancellationRef] = (),
     ) -> "ExecutionControl":
         if isinstance(child, ExecutionControl):
             cancellation = child.cancellation
@@ -204,14 +206,27 @@ class ExecutionControl:
             cancellation = child
             termination = self.termination
             child_metadata = {}
+        intermediates = tuple(
+            item
+            if isinstance(item, CancellationRef)
+            else CancellationRef.from_dict(item)
+            for item in tuple(intermediate_cancellations or ())
+        )
         return ExecutionControl(
             cancellation=cancellation,
-            ancestor_cancellations=(*self.ancestor_cancellations, self.cancellation),
+            ancestor_cancellations=(
+                *self.ancestor_cancellations,
+                self.cancellation,
+                *intermediates,
+            ),
             termination=termination,
             metadata={
                 **dict(self.metadata),
                 **child_metadata,
                 "parent_control_id": self.cancellation.control_id,
+                "intermediate_control_ids": [
+                    item.control_id for item in intermediates
+                ],
             },
         )
 
