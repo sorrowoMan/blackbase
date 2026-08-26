@@ -109,6 +109,50 @@ class BatchDisposition:
             },
         )
 
+    def compose(
+        self,
+        subsequent: "BatchDisposition",
+        *,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "BatchDisposition":
+        """Map a later decision over this accepted subset to original rows."""
+
+        if not isinstance(subsequent, BatchDisposition):
+            raise TypeError("subsequent disposition must be BatchDisposition")
+        if subsequent.proposed_count != self.accepted_count:
+            raise ValueError(
+                "composed disposition cardinality mismatch: "
+                f"first accepted={self.accepted_count}, "
+                f"subsequent proposed={subsequent.proposed_count}"
+            )
+        accepted = tuple(
+            self.accepted_indices[index]
+            for index in subsequent.accepted_indices
+        )
+        audit = {
+            "stages": (
+                {
+                    "reason": self.reason,
+                    "proposed_count": self.proposed_count,
+                    "accepted_count": self.accepted_count,
+                },
+                {
+                    "reason": subsequent.reason,
+                    "proposed_count": subsequent.proposed_count,
+                    "accepted_count": subsequent.accepted_count,
+                },
+            ),
+            **dict(metadata or {}),
+        }
+        return BatchDisposition(
+            proposed_count=self.proposed_count,
+            accepted_indices=accepted,
+            reason=str(reason or subsequent.reason or self.reason),
+            reservation_id=subsequent.reservation_id or self.reservation_id,
+            metadata=audit,
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "proposed_count": int(self.proposed_count),

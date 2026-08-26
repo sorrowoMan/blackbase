@@ -9,6 +9,7 @@ from blackbase.context import (
 from blackbase.context.snapshot_store import RedisSnapshotStore
 from blackbase.types import UnknownState
 import numpy as np
+import pytest
 
 
 def test_generic_snapshot_payload_roundtrip_has_one_logical_layer() -> None:
@@ -39,3 +40,16 @@ def test_redis_safe_codec_roundtrips_unknown_state_structure() -> None:
     assert np.allclose(candidate.as_array(), [1.5, 2.5])
     assert candidate.metadata["source"] == "unit"
     assert np.array_equal(candidate.metadata["mask"], [1, 0])
+
+
+def test_redis_snapshot_write_never_returns_a_handle_for_unwritten_payload() -> None:
+    store = object.__new__(RedisSnapshotStore)
+    store.serializer = "safe"
+    store.max_payload_bytes = 1
+    store.default_ttl_seconds = None
+    store._key_prefix = "test:snapshot"
+    store.hmac_env_var = "BLACKBASE_TEST_UNUSED_HMAC"
+    store.unsafe_allow_unsigned = False
+
+    with pytest.raises(ValueError, match="snapshot payload too large"):
+        store.write({"value": [1, 2, 3]}, key="too-large")

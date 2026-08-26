@@ -21,6 +21,11 @@ import warnings
 from typing import Any, Dict, Mapping, Optional
 
 from ._soft_error import report_soft_error
+from .lifecycle import (
+    PluginLifecycleCleanupError,
+    PluginLifecycleDispatchError,
+    PluginLifecycleReceipt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +116,23 @@ class PluginBase(ABC):
         return None
 
     def on_generation_start(self, generation: int):
-        """Called at the start of each generation/step. (nsgablack: on_generation_start, mlblack: on_step_start)"""
+        """Called when one committed logical generation transaction starts."""
         return None
 
     def on_generation_end(self, generation: int):
-        """Called at the end of each generation/step. (nsgablack: on_generation_end, mlblack: on_step_end)"""
+        """Called when the matching committed generation transaction ends."""
+        return None
+
+    def on_step_attempt_start(self, attempt: int, logical_step: int):
+        """Called before every physical step attempt."""
+        return None
+
+    def on_step_attempt_end(self, attempt: int, logical_step: int, outcome: Any):
+        """Called after every physical attempt, including failed attempts."""
+        return None
+
+    def on_generation_committed(self, generation: int, outcome: Any):
+        """Called only after a logical generation/step was committed."""
         return None
 
     def on_step(self, solver, generation: int):
@@ -123,7 +140,20 @@ class PluginBase(ABC):
         return None
 
     def on_solver_finish(self, result):
-        """Called when the solver/trainer finishes. (nsgablack: on_solver_finish, mlblack: on_fit_end)"""
+        """Called while the solver/trainer is finishing, before teardown."""
+        return None
+
+    def on_solver_finalization_prepare(self, result):
+        """Validate staged final output after teardown, before publication.
+
+        Transactional runtimes may use this strict hook as a publication veto.
+        ``result`` is deliberately provisional here; durable refs must not be
+        exposed until every participant has accepted the finalization plan.
+        """
+        return None
+
+    def on_solver_finalized(self, result):
+        """Called after teardown succeeds and the final result is authoritative."""
         return None
 
     def on_context_build(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,6 +392,144 @@ class PluginManager:
                         f"{traceback.format_exc()}"
                     )
 
+    def begin_lifecycle(
+        self,
+        event_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> PluginLifecycleReceipt:
+        """Run one lifecycle start and return the exact successful participants.
+
+        In strict mode a failing participant aborts the start phase, but the
+        raised error carries the partial receipt so the caller can still close
+        every participant that already started.  Non-strict mode preserves the
+        normal soft-error policy and continues building the receipt.
+        """
+
+        started: list[PluginBase] = []
+        for plugin in self.plugins:
+            if not plugin.enabled or bool(getattr(plugin, "_attach_failed", False)):
+                continue
+            handler = getattr(plugin, event_name, None)
+            if not callable(handler):
+                continue
+            try:
+                self._invoke_lifecycle_handler(
+                    plugin,
+                    event_name,
+                    "lifecycle_start",
+                    *args,
+                    **kwargs,
+                )
+                started.append(plugin)
+            except Exception as exc:
+                receipt = PluginLifecycleReceipt.capture(event_name, started)
+                if self.strict:
+                    raise PluginLifecycleDispatchError(
+                        event_name=event_name,
+                        plugin_name=str(plugin.name),
+                        receipt=receipt,
+                        cause=exc,
+                    ) from exc
+                print(
+                    f"[WARNING] Plugin {plugin.name} failed to handle {event_name}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+        return PluginLifecycleReceipt.capture(event_name, started)
+
+    def finish_lifecycle(
+        self,
+        receipt: PluginLifecycleReceipt,
+        event_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Close every participant in a receipt, independently and exactly once."""
+
+        if not isinstance(receipt, PluginLifecycleReceipt):
+            raise TypeError("receipt must be a PluginLifecycleReceipt")
+        errors: list[tuple[str, BaseException]] = []
+        for plugin in receipt.participants:
+            handler = getattr(plugin, event_name, None)
+            if not callable(handler):
+                continue
+            try:
+                self._invoke_lifecycle_handler(
+                    plugin,
+                    event_name,
+                    "lifecycle_end",
+                    *args,
+                    **kwargs,
+                )
+            except BaseException as exc:
+                errors.append((str(plugin.name), exc))
+                if not self.strict:
+                    print(
+                        f"[WARNING] Plugin {plugin.name} failed to handle {event_name}: {exc}\n"
+                        f"{traceback.format_exc()}"
+                    )
+        if errors and self.strict:
+            raise PluginLifecycleCleanupError(
+                event_name=event_name,
+                errors=errors,
+            ) from errors[0][1]
+
+    def _invoke_lifecycle_handler(
+        self,
+        plugin: PluginBase,
+        event_name: str,
+        mode: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        handler = getattr(plugin, event_name)
+        t0 = time.time()
+        try:
+            result = handler(*args, **kwargs)
+        except BaseException as exc:
+            self._emit_event_hook(
+                {
+                    "mode": str(mode),
+                    "event_name": str(event_name),
+                    "plugin_name": str(plugin.name),
+                    "plugin_class": plugin.__class__.__name__,
+                    "plugin": plugin,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            raise
+        dt = max(0.0, float(time.time() - t0))
+        prof = getattr(plugin, "_profile", None)
+        if isinstance(prof, dict):
+            prof["total_s"] = float(prof.get("total_s", 0.0) or 0.0) + dt
+            events = prof.get("events")
+            if not isinstance(events, dict):
+                events = {}
+                prof["events"] = events
+            events[event_name] = float(events.get(event_name, 0.0) or 0.0) + dt
+        self._emit_event_hook(
+            {
+                "mode": str(mode),
+                "event_name": str(event_name),
+                "plugin_name": str(plugin.name),
+                "plugin_class": plugin.__class__.__name__,
+                "plugin": plugin,
+                "status": "ok",
+                "has_result": result is not None,
+            }
+        )
+        if result is not None:
+            warnings.warn(
+                (
+                    f"Plugin '{plugin.name}' returned a non-None result for lifecycle "
+                    f"event '{event_name}' (ignored)."
+                ),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return result
+
     def dispatch(self, event_name: str, *args, **kwargs):
         """Dispatch an event and return the last non-None result."""
         out = None
@@ -513,7 +681,13 @@ class PluginManager:
                 )
 
     def on_solver_init(self, solver):
-        """Notify all plugins that solver init has started."""
+        """Start the run lifecycle and return its exact participant receipt.
+
+        A Plugin enters the receipt only after both attachment and
+        ``on_solver_init`` complete.  Strict failures carry the partial receipt
+        so callers can close already-started Plugins without notifying Plugins
+        that never acquired run-level resources.
+        """
         self._solver = solver
         self._context_build_writers = {}
         try:
@@ -527,6 +701,7 @@ class PluginManager:
                 strict=False,
                 level="debug",
             )
+        started: list[PluginBase] = []
         for plugin in self.plugins:
             if plugin.enabled:
                 if bool(getattr(plugin, "_attach_failed", False)):
@@ -537,8 +712,19 @@ class PluginManager:
                 except Exception as exc:
                     plugin._attach_failed = True
                     plugin._attach_error = str(exc)
-                    if bool(getattr(solver, "plugin_strict", False)):
-                        raise
+                    strict_attach = self.strict or bool(
+                        getattr(solver, "plugin_strict", False)
+                    )
+                    if strict_attach:
+                        receipt = PluginLifecycleReceipt.capture(
+                            "on_solver_init", started
+                        )
+                        raise PluginLifecycleDispatchError(
+                            event_name="on_solver_init.attach",
+                            plugin_name=str(plugin.name),
+                            receipt=receipt,
+                            cause=exc,
+                        ) from exc
                     report_soft_error(
                         component="PluginManager",
                         event="on_solver_init.attach",
@@ -549,13 +735,27 @@ class PluginManager:
                     )
                     continue
                 try:
-                    plugin.on_solver_init(solver)
+                    self._invoke_lifecycle_handler(
+                        plugin,
+                        "on_solver_init",
+                        "run_lifecycle_start",
+                        solver,
+                    )
+                    started.append(plugin)
                 except Exception as exc:
                     strict_init = bool(getattr(plugin, "raise_on_init_error", False)) or bool(
                         getattr(plugin, "strict_init", False)
-                    )
+                    ) or self.strict or bool(getattr(solver, "plugin_strict", False))
                     if strict_init:
-                        raise
+                        receipt = PluginLifecycleReceipt.capture(
+                            "on_solver_init", started
+                        )
+                        raise PluginLifecycleDispatchError(
+                            event_name="on_solver_init",
+                            plugin_name=str(plugin.name),
+                            receipt=receipt,
+                            cause=exc,
+                        ) from exc
                     warnings.warn(
                         f"Plugin '{plugin.name}' init failed: {exc}",
                         RuntimeWarning,
@@ -569,6 +769,7 @@ class PluginManager:
                         strict=False,
                         level="warning",
                     )
+        return PluginLifecycleReceipt.capture("on_solver_init", started)
 
     def on_population_init(self, population, objectives, violations):
         self.trigger("on_population_init", population, objectives, violations)
@@ -579,11 +780,33 @@ class PluginManager:
     def on_generation_end(self, generation: int):
         self.trigger("on_generation_end", generation)
 
+    def on_step_attempt_start(self, attempt: int, logical_step: int):
+        self.trigger("on_step_attempt_start", attempt, logical_step)
+
+    def on_step_attempt_end(self, attempt: int, logical_step: int, outcome: Any):
+        self.trigger("on_step_attempt_end", attempt, logical_step, outcome)
+
+    def on_generation_committed(self, generation: int, outcome: Any):
+        self.trigger("on_generation_committed", generation, outcome)
+
     def on_step(self, solver, generation: int):
         self.trigger("on_step", solver, generation)
 
     def on_solver_finish(self, result):
-        self.trigger("on_solver_finish", result)
+        receipt = self.current_lifecycle_receipt("on_solver_init")
+        self.finish_lifecycle(receipt, "on_solver_finish", result)
+
+    def on_solver_finalization_prepare(self, result):
+        receipt = self.current_lifecycle_receipt("on_solver_init")
+        self.finish_lifecycle(
+            receipt,
+            "on_solver_finalization_prepare",
+            result,
+        )
+
+    def on_solver_finalized(self, result):
+        receipt = self.current_lifecycle_receipt("on_solver_init")
+        self.finish_lifecycle(receipt, "on_solver_finalized", result)
 
     def on_context_build(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch context build to all plugins; returns the last non-None result."""
@@ -596,7 +819,29 @@ class PluginManager:
         self.trigger("on_evaluate_end", candidate, feedback, context)
 
     def on_error(self, error: BaseException, context: Optional[Dict[str, Any]] = None):
-        self.trigger("on_error", error, context)
+        receipt = self.current_lifecycle_receipt("on_solver_init")
+        self.finish_lifecycle(receipt, "on_error", error, context)
+
+    def current_lifecycle_receipt(
+        self,
+        start_event: str,
+    ) -> PluginLifecycleReceipt:
+        """Capture currently eligible participants for compatibility callers.
+
+        Run loops should retain the receipt returned by ``on_solver_init``.
+        This fallback keeps direct manager calls independent and exhaustive
+        when no enclosing run owns such a receipt.
+        """
+
+        return PluginLifecycleReceipt.capture(
+            start_event,
+            tuple(
+                plugin
+                for plugin in self.plugins
+                if plugin.enabled
+                and not bool(getattr(plugin, "_attach_failed", False))
+            ),
+        )
 
     def list_plugins(self, enabled_only: bool = False) -> list:
         """List plugins, optionally only enabled ones."""

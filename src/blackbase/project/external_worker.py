@@ -358,10 +358,12 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 def _validate_request_authorities(request: CaseRunRequest, project_root: Path) -> None:
     """Reject worker payloads that redirect durable authorities outside the Project."""
 
-    for ref in (
-        *request.control.ancestor_cancellations,
-        request.control.cancellation,
-    ):
+    for ref in (request.control.cancellation,):
+        if ref.process_local:
+            raise PermissionError(
+                "External Case worker requires SQLite or Redis cancellation "
+                "authority; memory is process-local"
+            )
         if ref.backend == "sqlite":
             _require_project_path(Path(ref.path), project_root, label="cancellation authority")
     metadata = dict(request.resource_context.get("metadata", {}) or {})

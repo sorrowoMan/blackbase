@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .runtime import path_declares_check_argument
+from .dag import DagStagePlan
+
+from .runtime import (
+    MIN_PROJECT_LEASE_HEARTBEAT_RATIO,
+    MIN_PROJECT_LEASE_TTL_SECONDS,
+    path_declares_check_argument,
+)
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,8 @@ def _check_project_config(path: Path, diags: list[DoctorDiagnostic]) -> None:
             "run_all_in_parallel",
             "external",
             "external_workers",
+            "dag",
+            "dependency_graph",
         }:
             diags.append(
                 DoctorDiagnostic(
@@ -275,6 +283,56 @@ def _check_project_config(path: Path, diags: list[DoctorDiagnostic]) -> None:
             )
         if policy in {"external", "external_workers"}:
             _check_external_stage(stage, stage_name=stage_name, path=path, diags=diags)
+        if policy in {"dag", "dependency_graph"}:
+            try:
+                plan = DagStagePlan.from_stage(stage)
+            except ValueError as exc:
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-dag-invalid",
+                        str(exc),
+                        str(path),
+                    )
+                )
+            else:
+                edge_count = sum(len(items) for items in plan.dependencies.values())
+                diags.append(
+                    DoctorDiagnostic(
+                        "info",
+                        "project-dag-valid",
+                        f"DAG Stage '{stage_name}' validated {len(plan.cases)} "
+                        f"Case(s) and {edge_count} dependency edge(s).",
+                        str(path),
+                    )
+                )
+            stage_mode = str(stage.get("mode", "build") or "build")
+            case_modes = stage.get("case_modes", {}) or {}
+            if not isinstance(case_modes, Mapping):
+                diags.append(
+                    DoctorDiagnostic(
+                        "error",
+                        "project-dag-case-modes-invalid",
+                        f"DAG Stage '{stage_name}' case_modes must be a mapping.",
+                        str(path),
+                    )
+                )
+            else:
+                invalid_modes = {
+                    case_name: str(case_modes.get(case_name, stage_mode) or "build")
+                    for case_name in case_names
+                    if str(case_modes.get(case_name, stage_mode) or "build") != "build"
+                }
+                if invalid_modes:
+                    diags.append(
+                        DoctorDiagnostic(
+                            "error",
+                            "project-dag-cli-mode",
+                            f"DAG Stage '{stage_name}' requires mode='build': "
+                            f"{invalid_modes}.",
+                            str(path),
+                        )
+                    )
         _check_stage_timeouts(stage, stage_name=stage_name, path=path, diags=diags)
         _check_termination_config(
             stage.get("termination", {}),
@@ -447,21 +505,57 @@ def _check_l0_config(
         heartbeat = float(config.get("lease_heartbeat_seconds", 10.0))
     except (TypeError, ValueError):
         ttl = heartbeat = -1.0
-    if ttl <= 0:
+    if ttl < MIN_PROJECT_LEASE_TTL_SECONDS:
         diags.append(
             DoctorDiagnostic(
                 "error",
                 "project-l0-lease-ttl-invalid",
-                "L0.lease_ttl_seconds must be positive.",
+                "L0.lease_ttl_seconds must be at least "
+                f"{MIN_PROJECT_LEASE_TTL_SECONDS:g} second for Project execution.",
                 str(path),
             )
         )
-    if heartbeat <= 0 or heartbeat >= ttl:
+    if heartbeat <= 0 or heartbeat * MIN_PROJECT_LEASE_HEARTBEAT_RATIO > ttl:
         diags.append(
             DoctorDiagnostic(
                 "error",
                 "project-l0-lease-heartbeat-invalid",
-                "L0.lease_heartbeat_seconds must be positive and smaller than lease_ttl_seconds.",
+                "L0.lease_heartbeat_seconds must be positive and no greater than "
+                f"lease_ttl_seconds / {MIN_PROJECT_LEASE_HEARTBEAT_RATIO:g}.",
+                str(path),
+            )
+        )
+    try:
+        control_ttl = float(config.get("control_active_ttl_seconds", 120.0))
+        control_heartbeat = float(config.get("control_heartbeat_seconds", 30.0))
+        control_retention = float(config.get("control_retention_seconds", 0.0))
+    except (TypeError, ValueError):
+        control_ttl = control_heartbeat = control_retention = -1.0
+    if control_ttl <= 0:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-control-ttl-invalid",
+                "L0.control_active_ttl_seconds must be positive.",
+                str(path),
+            )
+        )
+    if control_heartbeat <= 0 or control_heartbeat * 2 > control_ttl:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-control-heartbeat-invalid",
+                "L0.control_heartbeat_seconds must be positive and no greater than "
+                "control_active_ttl_seconds / 2.",
+                str(path),
+            )
+        )
+    if control_retention < 0:
+        diags.append(
+            DoctorDiagnostic(
+                "error",
+                "project-l0-control-retention-invalid",
+                "L0.control_retention_seconds must be non-negative.",
                 str(path),
             )
         )

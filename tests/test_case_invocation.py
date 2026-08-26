@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from blackbase.project import (
+    attach_failure_evidence,
     CaseExecutor,
     CaseFailure,
     CaseInvocationError,
+    CaseInvoker,
     CaseRunRequest,
     CaseRunResult,
+    ChildResourceGrant,
     ExecutionControl,
     execute_project,
 )
 from blackbase.project.scaffold import add_case, create_project
-from blackbase.resources import CancellationRef, CancellationToken, ResourceRequest
+from blackbase.resources import (
+    CancellationHeartbeat,
+    CancellationRef,
+    CancellationToken,
+    BudgetHandle,
+    ResourceRequest,
+)
+from blackbase.resources import PoolScheduler
 
 
 def test_parent_case_invokes_complete_child_with_lineage_grant_budget_and_artifact(
@@ -126,8 +139,12 @@ GROUPS = {"default": {"stages": ["outer"]}}
     assert child_result.identity.parent_case_run_id == parent_result.identity.case_run_id
     assert child_result.identity.root_run_id == parent_result.identity.root_run_id
     assert child_result.identity.depth == parent_result.identity.depth + 1
-    assert child_result.control.ancestor_cancellations[-1].control_id == (
+    assert child_result.control.ancestor_cancellations == ()
+    assert child_result.control.cancellation.parent_control_id == (
         parent_result.request.control.cancellation.control_id
+    )
+    assert child_result.control.cancellation.lineage_depth == (
+        parent_result.request.control.cancellation.lineage_depth + 1
     )
     assert child_result.output["threads"] == 1
     assert child_result.output["grant"]["parent_case_run_id"] == (
@@ -138,6 +155,121 @@ GROUPS = {"default": {"stages": ["outer"]}}
     assert child_result.artifact_refs["answer"].uri
     assert project_result.artifact_registry["parent.answer"] == (
         child_result.artifact_refs["answer"]
+    )
+    with sqlite3.connect(project_root / ".blackbase" / "l0_controls.sqlite") as connection:
+        remaining_controls = connection.execute(
+            "SELECT COUNT(*) FROM cancellation_controls"
+        ).fetchone()[0]
+    assert remaining_controls == 0
+
+
+@pytest.mark.parametrize("commit", [True, False])
+def test_case_artifact_transaction_exposes_all_or_no_refs(tmp_path, commit) -> None:
+    project_root = create_project(
+        tmp_path / f"artifact_transaction_{commit}",
+        framework="blackbase",
+    )
+    case_root = add_case("publisher", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        f"""
+class Publisher:
+    def run(self):
+        transaction = self.case_runtime.begin_finalization_transaction("test-finalization")
+        transaction.publish("model", {{"value": 1}}, kind="model")
+        transaction.publish("report", {{"ok": True}}, kind="report")
+        visible_before = sorted(self.case_runtime.artifact_refs)
+        if {commit!r}:
+            committed = transaction.prepare()
+            return {{
+                "visible_before": visible_before,
+                "committed": sorted(committed),
+            }}
+        transaction.abort("test-abort")
+        return {{"visible_before": visible_before, "committed": []}}
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, resource_context, component_overrides
+    return Publisher()
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (project_root / "project_config.py").write_text(
+        """
+PROJECT_NAME = "artifact_transaction"
+STAGES = [{"name": "publish", "cases": ["publisher"]}]
+GROUPS = {"default": {"stages": ["publish"]}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    project_result = execute_project(project_root, record=False)
+
+    assert project_result.ok
+    case_result = project_result.case_results[0]
+    assert case_result.output["visible_before"] == ()
+    if commit:
+        assert set(case_result.artifact_refs) == {"model", "report"}
+        assert set(case_result.artifact_publications) == {"model", "report"}
+    else:
+        assert case_result.artifact_refs == {}
+
+
+def test_finalized_observer_runs_after_seal_and_cannot_veto_success(tmp_path) -> None:
+    project_root = create_project(
+        tmp_path / "post_seal_observer",
+        framework="blackbase",
+    )
+    case_root = add_case("publisher", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        """
+class Publisher:
+    def run(self):
+        transaction = self.case_runtime.begin_finalization_transaction("result")
+        transaction.publish("model", {"value": 1}, kind="model")
+
+        def observe(publications):
+            receipt = publications["model"]
+            assert receipt.metadata["case_finalization_sealed"] is True
+            raise RuntimeError("diagnostic observer failed")
+
+        self.case_runtime.register_finalization_observer(
+            observe,
+            name="test.post_seal",
+        )
+        return {"value": 1}
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, resource_context, component_overrides
+    return Publisher()
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (project_root / "project_config.py").write_text(
+        """
+PROJECT_NAME = "post_seal_observer"
+STAGES = [{"name": "publish", "cases": ["publisher"]}]
+GROUPS = {"default": {"stages": ["publish"]}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    project_result = execute_project(project_root, record=False)
+    result = project_result.case_results[0]
+
+    assert project_result.ok
+    assert result.ok
+    assert set(result.artifact_refs) == {"model"}
+    assert result.artifact_publications["model"].metadata[
+        "case_finalization_sealed"
+    ] is True
+    observer_audit = result.metadata["finalization_observers"]
+    assert observer_audit["status"] == "degraded"
+    assert observer_audit["failure_count"] == 1
+    assert observer_audit["failures"][0]["observer"] == "test.post_seal"
+    assert observer_audit["failures"][0]["message"] == (
+        "diagnostic observer failed"
     )
 
 
@@ -403,6 +535,147 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
     assert timed_out.failure.kind == "CaseDeadlineExceeded"
 
 
+def _build_cleanup_case(tmp_path):
+    project_root = create_project(tmp_path / "cleanup_project", framework="blackbase")
+    case_root = add_case("clean", "solver", project_root=project_root)
+    (case_root / "build_solver.py").write_text(
+        """
+class Clean:
+    def run(self):
+        return {"value": 42}
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, resource_context, component_overrides
+    return Clean()
+""".lstrip(),
+        encoding="utf-8",
+    )
+    request = CaseRunRequest(
+        project_name="cleanup_project",
+        stage_name="cleanup",
+        case_name="clean",
+        resource_context={
+            "threads": 1,
+            "grant": {"workers": 1, "threads": 1},
+            "metadata": {
+                "artifact_authority": {
+                    "backend": "filesystem",
+                    "root": str(project_root / ".blackbase" / "artifacts"),
+                    "namespace": "cleanup_project",
+                    "schema_version": 1,
+                }
+            },
+        },
+    )
+    return project_root, case_root, request
+
+
+def test_case_result_freezes_runtime_audit_after_scheduler_shutdown(tmp_path) -> None:
+    project_root, _case_root, request = _build_cleanup_case(tmp_path)
+
+    result = CaseExecutor(project_root).execute(request)
+
+    assert result.ok
+    assert result.metadata["runtime_audit"]["stage_scheduler"]["shutdown"] is True
+    assert result.metadata["cleanup"]["status"] == "succeeded"
+    assert result.metadata["cleanup"]["scheduler"]["shutdown"] is True
+    assert result.finished_at >= result.metadata["cleanup"]["finished_at"]
+
+
+def test_scheduler_cleanup_failure_is_structured_and_does_not_escape(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    project_root, _case_root, request = _build_cleanup_case(tmp_path)
+
+    def fail_shutdown(self, wait=True):
+        del self, wait
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(PoolScheduler, "shutdown", fail_shutdown)
+    result = CaseExecutor(project_root).execute(request)
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert result.failure is not None
+    assert result.failure.phase == "cleanup"
+    assert result.failure.message == "cleanup failed"
+    assert result.metadata["cleanup"]["status"] == "failed"
+    assert result.metadata["cleanup"]["failure"]["phase"] == "cleanup"
+
+
+def test_cleanup_failure_aborts_provisional_finalization_artifacts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    project_root, case_root, request = _build_cleanup_case(tmp_path)
+    (case_root / "build_solver.py").write_text(
+        """
+class Publisher:
+    def run(self):
+        transaction = self.case_runtime.begin_finalization_transaction("cleanup")
+        ref = transaction.publish("model", {"value": 42}, kind="model")
+        transaction.prepare()
+        return {"staged_uri": ref.uri}
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, resource_context, component_overrides
+    return Publisher()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    def fail_shutdown(self, wait=True):
+        del self, wait
+        raise RuntimeError("cleanup failed after prepare")
+
+    monkeypatch.setattr(PoolScheduler, "shutdown", fail_shutdown)
+    result = CaseExecutor(project_root).execute(request)
+
+    assert result.status == "failed"
+    assert result.artifact_publications == {}
+    assert result.artifact_refs == {}
+    artifact_payloads = tuple(
+        path
+        for path in (project_root / ".blackbase" / "artifacts").rglob("*.json")
+        if ".publication-ledger" not in path.parts
+    )
+    assert artifact_payloads == ()
+
+
+def test_cleanup_failure_preserves_primary_case_failure(tmp_path, monkeypatch) -> None:
+    project_root, case_root, request = _build_cleanup_case(tmp_path)
+    (case_root / "build_solver.py").write_text(
+        """
+class Broken:
+    def run(self):
+        raise ValueError("primary failed")
+
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, resource_context, component_overrides
+    return Broken()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    def fail_shutdown(self, wait=True):
+        del self, wait
+        raise RuntimeError("cleanup also failed")
+
+    monkeypatch.setattr(PoolScheduler, "shutdown", fail_shutdown)
+    result = CaseExecutor(project_root).execute(request)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.kind == "ValueError"
+    assert result.failure.phase == "run"
+    assert result.failure.message == "primary failed"
+    assert result.metadata["cleanup"]["failure"]["message"] == "cleanup also failed"
+
+
 def test_case_result_envelope_round_trips_strict_schema() -> None:
     request = CaseRunRequest(
         project_name="roundtrip",
@@ -462,6 +735,38 @@ def test_failed_child_result_raises_structured_invocation_error() -> None:
     assert child_details["identity"] == result.identity.as_dict()
     assert child_details["case_name"] == "child"
     assert child_details["status"] == "failed"
+
+
+def test_formal_exception_evidence_survives_case_failure_envelope() -> None:
+    error = RuntimeError("evaluation failed")
+    attach_failure_evidence(
+        error,
+        "evaluation",
+        {"event_id": "event-7", "phase": "provider"},
+    )
+
+    failure = CaseFailure.from_exception(error, phase="evaluate")
+
+    assert failure.details["evaluation"] == {
+        "event_id": "event-7",
+        "phase": "provider",
+    }
+
+
+def test_cancellation_heartbeat_close_rejects_a_live_worker_thread() -> None:
+    class _StuckThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            assert timeout >= 0.1
+
+    token = CancellationToken(CancellationRef(active_ttl_seconds=0.0))
+    heartbeat = CancellationHeartbeat(token)
+    heartbeat._thread = _StuckThread()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="thread did not stop"):
+        heartbeat.close()
 
 
 def test_successful_child_result_raise_for_failure_is_a_noop() -> None:
@@ -551,3 +856,75 @@ GROUPS = {"default": {"stages": ["outer"]}}
     assert first.identity.case_run_id != second.identity.case_run_id
     assert first.identity.invocation_id != second.identity.invocation_id
     assert first.output["budget_namespace"] != second.output["budget_namespace"]
+
+
+def test_child_failure_keeps_primary_cause_when_budget_settlement_also_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    parent = CaseRunRequest(
+        project_name="project",
+        stage_name="outer",
+        case_name="parent",
+        resource_context={"threads": 1, "grant": {"workers": 1, "threads": 1}},
+    )
+    executor = CaseExecutor(tmp_path)
+    invoker = CaseInvoker(
+        executor,
+        parent,
+        cancellation_tokens=(CancellationToken(parent.control.cancellation),),
+    )
+    grant = ChildResourceGrant(
+        grant_id="grant-1",
+        parent_lease_id="lease-1",
+        parent_case_run_id=parent.identity.case_run_id,
+        namespace="project",
+        resources={"workers": 1, "threads": 1},
+    )
+
+    class _GrantPool:
+        @contextmanager
+        def acquire(self, *args, **kwargs):
+            del args, kwargs
+            yield grant
+
+    calls = {"settlement": 0}
+    invoker._grants = _GrantPool()
+    delegation = SimpleNamespace(handle=BudgetHandle.local("evaluations", 1))
+    monkeypatch.setattr(
+        invoker,
+        "_delegate_budgets",
+        lambda *args: (delegation,),
+    )
+    monkeypatch.setattr(invoker, "_child_resource_context", lambda *args, **kwargs: {})
+
+    def settle(_delegations):
+        calls["settlement"] += 1
+        raise ConnectionError("settlement authority unavailable")
+
+    monkeypatch.setattr(invoker, "_finalize_budgets", settle)
+    monkeypatch.setattr(
+        executor,
+        "execute",
+        lambda request: (_ for _ in ()).throw(RuntimeError("child exploded")),
+    )
+
+    result = invoker.invoke(
+        CaseRunRequest(
+            project_name="project",
+            stage_name="inner",
+            case_name="child",
+            resource_request={"workers": 1, "threads": 1},
+            budget_request={"evaluations": 1},
+        )
+    )
+
+    assert not result.ok
+    assert result.failure is not None
+    assert result.failure.kind == "RuntimeError"
+    assert result.failure.message == "child exploded"
+    assert result.failure.details["budget_settlement"] == {
+        "error_type": "ConnectionError",
+        "message": "settlement authority unavailable",
+    }
+    assert calls["settlement"] == 1

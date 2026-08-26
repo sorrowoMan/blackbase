@@ -10,6 +10,7 @@ from blackbase.evaluation import (
     EvaluationBinding,
     EvaluationGateway,
     EvaluationProviderContractError,
+    EvaluationProviderConformanceError,
     EvaluationProviderRegistry,
     EvaluationProviderSpec,
     EvaluationProviderUnavailable,
@@ -23,6 +24,7 @@ from blackbase.evaluation import (
     StateTransitionResult,
     StateTransitionMethodSpec,
     StateVersionConflict,
+    verify_copy_on_write_predecessors,
 )
 from blackbase.resources import ResourceContext, ResourceRequirement
 from blackbase.state_ref import StateRef
@@ -61,11 +63,13 @@ class TransitionRecordingProvider(RecordingProvider):
         spec: EvaluationProviderSpec,
         *,
         invalid_version: bool = False,
+        in_place_slot: bool = False,
         fail: bool = False,
     ) -> None:
         super().__init__(spec)
         self.transition_calls = 0
         self.invalid_version = invalid_version
+        self.in_place_slot = in_place_slot
         self.transition_fail = fail
 
     def transition(self, request, binding):
@@ -100,6 +104,17 @@ class TransitionRecordingProvider(RecordingProvider):
             )
             if previous_m is None
             else previous_m.next_version()
+            if self.in_place_slot
+            else StateRef(
+                provider_id=previous_m.provider_id,
+                state_id=f"{previous_m.state_id}-successor",
+                state_kind=previous_m.state_kind,
+                scope_id=previous_m.scope_id,
+                trajectory_id=previous_m.trajectory_id,
+                device=previous_m.device,
+                version=previous_m.version + 1,
+                transport_scope=previous_m.transport_scope,
+            )
         )
         return StateTransitionResult(
             request_id=request.request_id,
@@ -137,6 +152,47 @@ class ReleaseRecordingProvider(RecordingProvider):
             status="released",
             released_count=2,
             released_state_ids=("m", "v"),
+        )
+
+
+class PartialReleaseRecordingProvider(ReleaseRecordingProvider):
+    def release(self, request, binding):
+        del binding
+        return StateReleaseResult(
+            request_id=request.request_id,
+            provider_id=request.provider_id,
+            status="released",
+            released_count=1,
+            released_state_ids=(request.state_ids[0],),
+        )
+
+
+class CopyOnWriteRecordingProvider(TransitionRecordingProvider):
+    def __init__(self, spec: EvaluationProviderSpec, *, delete_predecessor=False) -> None:
+        super().__init__(spec)
+        self.delete_predecessor = bool(delete_predecessor)
+        self.live_state_ids: set[str] = set()
+        self.materialization_calls = 0
+
+    def transition(self, request, binding):
+        self.live_state_ids.update(ref.state_id for ref in request.slot_refs.values())
+        result = super().transition(request, binding)
+        self.live_state_ids.update(ref.state_id for ref in result.slot_refs.values())
+        if self.delete_predecessor:
+            for ref in request.slot_refs.values():
+                self.live_state_ids.discard(ref.state_id)
+        return result
+
+    def materialize(self, request, binding):
+        del binding
+        self.materialization_calls += 1
+        if request.state_ref.state_id not in self.live_state_ids:
+            raise KeyError(request.state_ref.state_id)
+        return StateMaterializationResult(
+            request_id=request.request_id,
+            state_ref=request.state_ref,
+            target=request.target,
+            value=UnknownState(values=np.asarray([0.0])),
         )
 
 
@@ -187,6 +243,11 @@ def test_candidate_batch_keeps_semantic_and_numeric_views_aligned() -> None:
     restored = decode_shared_value(encode_shared_value(batch))
     assert isinstance(restored, CandidateBatch)
     assert restored.semantic_states[1].metadata["architecture"] == "b"
+
+    selected = batch.subset(np.asarray([1], dtype=int))
+    assert selected.numeric_matrix.tolist() == [[1.0, 2.0]]
+    assert selected.candidate_tokens == ("candidate-b",)
+    assert selected.semantic_states[0].metadata["architecture"] == "b"
 
 
 def test_candidate_batch_views_remain_immutable_after_validation() -> None:
@@ -243,6 +304,27 @@ def test_state_release_is_bound_to_provider_scope_and_trajectory() -> None:
     assert result.binding is not None
     assert result.binding.audit["operation"] == "state_release"
     assert decode_shared_value(encode_shared_value(request)) == request
+
+
+def test_targeted_release_requires_terminal_receipt_for_every_state_id() -> None:
+    provider = PartialReleaseRecordingProvider(
+        EvaluationProviderSpec(provider_id="release/v1")
+    )
+    registry = EvaluationProviderRegistry()
+    registry.register(provider)
+
+    with pytest.raises(
+        EvaluationProviderContractError,
+        match="did not resolve every requested StateRef",
+    ):
+        EvaluationGateway(registry).release(
+            StateReleaseRequest(
+                provider_id="release/v1",
+                scope_id="case.fit",
+                state_ids=("m", "v"),
+            ),
+            ResourceContext(namespace="case.fit", grant={"threads": 1}),
+        )
 
 
 def test_feedback_can_carry_a_provider_owned_gradient_ref() -> None:
@@ -948,6 +1030,45 @@ def test_transition_provider_cannot_skip_version_fence_or_retry_type_error() -> 
         bound.execute(request)
     assert invalid.transition_calls == 1
 
+    in_place_slot = TransitionRecordingProvider(
+        EvaluationProviderSpec(
+            provider_id="numpy.in-place-slot/v1",
+            transition_methods=("gradient.adam",),
+            state_kinds=("model_parameters",),
+        ),
+        in_place_slot=True,
+    )
+    slot_registry = EvaluationProviderRegistry()
+    slot_registry.register(in_place_slot)
+    slot_request = StateTransitionRequest(
+        state_ref=StateRef(
+            provider_id=in_place_slot.spec.provider_id,
+            state_id="parameters-1",
+            state_kind="model_parameters",
+            scope_id="run.scope",
+            trajectory_id="fit-1",
+        ),
+        method_id="gradient.adam",
+        operands={"gradient": [1.0]},
+        slot_refs={
+            "m": StateRef(
+                provider_id=in_place_slot.spec.provider_id,
+                state_id="adam-m",
+                state_kind="optimizer_slot",
+                scope_id="run.scope",
+                trajectory_id="fit-1",
+            )
+        },
+    )
+    slot_bound = slot_registry.bind_transition(
+        slot_request,
+        ResourceContext(namespace="run.scope", grant={"threads": 1, "gpus": 0}),
+    )
+
+    with pytest.raises(EvaluationProviderContractError, match="copy-on-write"):
+        slot_bound.execute(slot_request)
+    assert in_place_slot.transition_calls == 1
+
     failing = TransitionRecordingProvider(
         EvaluationProviderSpec(
             provider_id="numpy.failing/v1",
@@ -990,3 +1111,163 @@ def test_state_version_conflict_preserves_expected_and_actual_versions() -> None
     assert conflict.expected_version == 4
     assert conflict.actual_version == 5
     assert "expected=4" in str(conflict)
+
+
+class _CopyOnWriteConformanceGateway:
+    def __init__(self, *, deleted_state_ids=()) -> None:
+        self.deleted_state_ids = set(deleted_state_ids)
+        self.materialized: list[str] = []
+
+    def materialize(self, request, resource_context):
+        del resource_context
+        state_id = request.state_ref.state_id
+        if state_id in self.deleted_state_ids:
+            raise KeyError(state_id)
+        self.materialized.append(state_id)
+        return StateMaterializationResult(
+            request_id=request.request_id,
+            state_ref=request.state_ref,
+            target=request.target,
+            value=UnknownState(values=np.asarray([0.0])),
+        )
+
+
+def _copy_on_write_transition_pair():
+    parameters = StateRef(
+        provider_id="provider/v1",
+        state_id="parameters",
+        state_kind="model_parameters",
+        scope_id="case.fit",
+        trajectory_id="run-1",
+    )
+    predecessor = StateRef(
+        provider_id="provider/v1",
+        state_id="slot-old",
+        state_kind="optimizer_slot.m",
+        scope_id="case.fit",
+        trajectory_id="run-1",
+    )
+    request = StateTransitionRequest(
+        request_id="transition-1",
+        state_ref=parameters,
+        method_id="gradient.adam",
+        slot_refs={"m": predecessor},
+    )
+    result = StateTransitionResult(
+        request_id=request.request_id,
+        method_id=request.method_id,
+        status="applied",
+        state_ref=StateRef(
+            provider_id="provider/v1",
+            state_id="parameters-next",
+            state_kind="model_parameters",
+            scope_id="case.fit",
+            trajectory_id="run-1",
+            version=1,
+        ),
+        slot_refs={
+            "m": StateRef(
+                provider_id="provider/v1",
+                state_id="slot-next",
+                state_kind="optimizer_slot.m",
+                scope_id="case.fit",
+                trajectory_id="run-1",
+                version=1,
+            )
+        },
+    )
+    return request, result
+
+
+def test_copy_on_write_conformance_materializes_every_predecessor() -> None:
+    request, result = _copy_on_write_transition_pair()
+    gateway = _CopyOnWriteConformanceGateway()
+
+    report = verify_copy_on_write_predecessors(
+        gateway,
+        request,
+        result,
+        ResourceContext(namespace="case.fit", grant={"threads": 1}),
+    )
+
+    assert report.conformant is True
+    assert report.checked_slots == ("m",)
+    assert gateway.materialized == ["slot-old"]
+
+
+def test_copy_on_write_conformance_rejects_deleted_predecessor() -> None:
+    request, result = _copy_on_write_transition_pair()
+    gateway = _CopyOnWriteConformanceGateway(deleted_state_ids={"slot-old"})
+
+    with pytest.raises(
+        EvaluationProviderConformanceError,
+        match="predecessor.*not materializable",
+    ):
+        verify_copy_on_write_predecessors(
+            gateway,
+            request,
+            result,
+            ResourceContext(namespace="case.fit", grant={"threads": 1}),
+        )
+
+
+def _copy_on_write_provider_spec() -> EvaluationProviderSpec:
+    return EvaluationProviderSpec(
+        provider_id="provider/v1",
+        capabilities=("autograd.backward",),
+        state_kinds=("model_parameters", "optimizer_slot.m"),
+        materialization_targets=("unknown_state",),
+        transition_methods=(
+            StateTransitionMethodSpec(
+                method_id="gradient.adam",
+                optional_slots=("m",),
+                result_slots=("m",),
+                slot_state_kinds={"m": ("optimizer_slot.m",)},
+                result_slot_state_kinds={"m": ("optimizer_slot.m",)},
+            ),
+        ),
+    )
+
+
+def test_gateway_certifies_copy_on_write_once_on_first_stateful_use() -> None:
+    request, _ = _copy_on_write_transition_pair()
+    provider = CopyOnWriteRecordingProvider(_copy_on_write_provider_spec())
+    registry = EvaluationProviderRegistry()
+    registry.register(provider)
+    gateway = EvaluationGateway(registry)
+    grant = ResourceContext(namespace="case.fit", grant={"threads": 1})
+
+    first = gateway.transition(request, grant)
+    second_request = StateTransitionRequest(
+        state_ref=first.state_ref,
+        method_id=request.method_id,
+        slot_refs=first.slot_refs,
+    )
+    gateway.transition(second_request, grant)
+
+    reports = registry.copy_on_write_certifications()
+    assert len(reports) == 1
+    assert reports[0].provider_id == "provider/v1"
+    assert reports[0].checked_slots == ("m",)
+    assert provider.materialization_calls == 1
+
+
+def test_gateway_rejects_provider_that_deletes_copy_on_write_predecessor() -> None:
+    request, _ = _copy_on_write_transition_pair()
+    provider = CopyOnWriteRecordingProvider(
+        _copy_on_write_provider_spec(),
+        delete_predecessor=True,
+    )
+    registry = EvaluationProviderRegistry()
+    registry.register(provider)
+
+    with pytest.raises(
+        EvaluationProviderConformanceError,
+        match="predecessor.*not materializable",
+    ):
+        EvaluationGateway(registry).transition(
+            request,
+            ResourceContext(namespace="case.fit", grant={"threads": 1}),
+        )
+
+    assert registry.copy_on_write_certifications() == ()

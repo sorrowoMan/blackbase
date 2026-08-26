@@ -15,6 +15,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 
 from .resources.model import DataRef
+from .selection import normalize_row_selector
 from .state_ref import StateRef
 
 
@@ -525,6 +526,20 @@ class CandidateBatch:
 
         return tuple(np.asarray(row, dtype=float).copy() for row in self.numeric_matrix)
 
+    def subset(self, selector: slice | Sequence[int] | np.ndarray) -> "CandidateBatch":
+        """Return an aligned semantic/numeric/token subset."""
+
+        indices = normalize_row_selector(selector, len(self.semantic_states))
+        return type(self)(
+            semantic_states=tuple(
+                self.semantic_states[int(index)] for index in indices
+            ),
+            numeric_matrix=self.numeric_matrix[indices],
+            candidate_tokens=tuple(
+                self.candidate_tokens[int(index)] for index in indices
+            ),
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             **_protocol_header("candidate_batch"),
@@ -554,18 +569,67 @@ class PopulationSnapshot:
     candidates: Sequence[UnknownState]
     objectives: np.ndarray
     constraints: Optional[np.ndarray] = None
+    candidate_tokens: Sequence[str | None] = field(default_factory=tuple)
     generation: int = 0
     timestamp: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "candidates", tuple(self.candidates or ()))
-        object.__setattr__(self, "objectives", np.asarray(self.objectives, dtype=float))
+        candidates = tuple(
+            candidate
+            if isinstance(candidate, UnknownState)
+            else UnknownState.from_protocol_payload(candidate)
+            if isinstance(candidate, Mapping)
+            else UnknownState(values=candidate)
+            for candidate in tuple(self.candidates or ())
+        )
+        objectives = np.asarray(self.objectives, dtype=float)
+        if objectives.ndim == 1:
+            objectives = (
+                objectives.reshape(1, -1)
+                if len(candidates) == 1
+                else objectives.reshape(-1, 1)
+            )
+        if objectives.ndim != 2 or objectives.shape[0] != len(candidates):
+            raise ValueError(
+                "PopulationSnapshot objectives must be a 2D array aligned with candidates"
+            )
+        tokens = tuple(self.candidate_tokens or ())
+        if not tokens:
+            tokens = (None,) * len(candidates)
+        if len(tokens) != len(candidates):
+            raise ValueError(
+                "PopulationSnapshot candidate_tokens must align with candidates"
+            )
+        tokens = tuple(
+            None if token is None else str(token).strip() or None
+            for token in tokens
+        )
+        object.__setattr__(self, "candidates", candidates)
+        object.__setattr__(self, "objectives", _readonly_array(objectives))
         if self.constraints is not None:
-            object.__setattr__(self, "constraints", np.asarray(self.constraints, dtype=float))
+            constraints = np.asarray(self.constraints, dtype=float)
+            if constraints.ndim == 0:
+                constraints = constraints.reshape(1)
+            if constraints.shape[0] != len(candidates):
+                raise ValueError(
+                    "PopulationSnapshot constraints must align with candidates"
+                )
+            object.__setattr__(self, "constraints", _readonly_array(constraints))
+        object.__setattr__(self, "candidate_tokens", tokens)
         object.__setattr__(self, "generation", int(self.generation))
         object.__setattr__(self, "timestamp", float(self.timestamp))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        canonical_metadata = _decode_shared_value(
+            _encode_shared_value(
+                dict(self.metadata or {}),
+                path="population_snapshot.metadata",
+            )
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_shared_value(dict(canonical_metadata or {})),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -576,6 +640,7 @@ class PopulationSnapshot:
             ],
             "objectives": self.objectives.tolist(),
             "constraints": None if self.constraints is None else self.constraints.tolist(),
+            "candidate_tokens": list(self.candidate_tokens),
             "generation": self.generation,
             "timestamp": self.timestamp,
             "metadata": _encode_shared_value(
@@ -601,6 +666,7 @@ class PopulationSnapshot:
                 if data.get("constraints") is None
                 else np.asarray(data.get("constraints"), dtype=float)
             ),
+            candidate_tokens=tuple(data.get("candidate_tokens", ()) or ()),
             generation=int(data.get("generation", 0) or 0),
             timestamp=float(data.get("timestamp", 0.0) or 0.0),
             metadata=dict(_decode_shared_value(data.get("metadata", {})) or {}),
@@ -628,10 +694,38 @@ class TrainerResult:
 
     def __post_init__(self) -> None:
         if self.best_objectives is not None:
-            object.__setattr__(self, "best_objectives", np.asarray(self.best_objectives, dtype=float))
-        object.__setattr__(self, "history", tuple(self.history or ()))
-        object.__setattr__(self, "report", dict(self.report or {}))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+            object.__setattr__(
+                self,
+                "best_objectives",
+                _readonly_array(np.asarray(self.best_objectives, dtype=float)),
+            )
+        object.__setattr__(
+            self,
+            "history",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    tuple(self.history or ()), path="trainer_result.history"
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "report",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    dict(self.report or {}), path="trainer_result.report"
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    dict(self.metadata or {}), path="trainer_result.metadata"
+                )
+            ),
+        )
         object.__setattr__(self, "best_model_ref", _coerce_data_ref(self.best_model_ref))
         object.__setattr__(self, "best_state_ref", _coerce_data_ref(self.best_state_ref))
         object.__setattr__(self, "population_ref", _coerce_data_ref(self.population_ref))
@@ -643,7 +737,7 @@ class TrainerResult:
             if ref is None:
                 raise TypeError(f"artifact_refs['{key}'] must be a DataRef")
             artifact_refs[str(key)] = ref
-        object.__setattr__(self, "artifact_refs", artifact_refs)
+        object.__setattr__(self, "artifact_refs", MappingProxyType(artifact_refs))
 
     def as_dict(self) -> dict[str, Any]:
         best_model = None
@@ -779,8 +873,19 @@ class SolveQuality:
                 raise ValueError(f"SolveQuality.{name} must be non-negative")
             object.__setattr__(self, name, normalized)
         if self.bound is not None:
-            object.__setattr__(self, "bound", float(self.bound))
-        object.__setattr__(self, "metrics", dict(self.metrics or {}))
+            bound = float(self.bound)
+            if not np.isfinite(bound):
+                raise ValueError("SolveQuality.bound must be finite")
+            object.__setattr__(self, "bound", bound)
+        object.__setattr__(
+            self,
+            "metrics",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    dict(self.metrics or {}), path="solve_quality.metrics"
+                )
+            ),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -830,6 +935,9 @@ class SolverResult:
     best_solution: Any = None
     best_objectives: Optional[np.ndarray] = None
     best_constraint_violation: Optional[float] = None
+    best_candidate_token: str | None = None
+    best_evaluation_id: str | None = None
+    best_provenance: Mapping[str, Any] = field(default_factory=dict)
     pareto_front: Optional[PopulationSnapshot] = None
     solve_status: str = "unknown"
     termination_reason: str = "unknown"
@@ -848,7 +956,7 @@ class SolverResult:
             object.__setattr__(
                 self,
                 "best_objectives",
-                np.asarray(self.best_objectives, dtype=float).reshape(-1),
+                _readonly_array(np.asarray(self.best_objectives, dtype=float).reshape(-1)),
             )
         if self.best_constraint_violation is not None:
             best_constraint_violation = float(self.best_constraint_violation)
@@ -861,6 +969,29 @@ class SolverResult:
                 "best_constraint_violation",
                 best_constraint_violation,
             )
+        object.__setattr__(
+            self,
+            "best_candidate_token",
+            None
+            if self.best_candidate_token is None
+            else str(self.best_candidate_token).strip() or None,
+        )
+        object.__setattr__(
+            self,
+            "best_evaluation_id",
+            None
+            if self.best_evaluation_id is None
+            else str(self.best_evaluation_id).strip() or None,
+        )
+        canonical_provenance = _encode_shared_value(
+            dict(self.best_provenance or {}),
+            path="solver_result.best_provenance",
+        )
+        object.__setattr__(
+            self,
+            "best_provenance",
+            _freeze_shared_value(dict(canonical_provenance or {})),
+        )
         solve_status = str(self.solve_status or "unknown").strip().lower()
         if solve_status not in SOLVE_STATUSES:
             raise ValueError(f"unsupported SolverResult solve_status '{solve_status}'")
@@ -887,9 +1018,33 @@ class SolverResult:
         if pareto_front is not None and not isinstance(pareto_front, PopulationSnapshot):
             pareto_front = PopulationSnapshot.from_dict(pareto_front)
         object.__setattr__(self, "pareto_front", pareto_front)
-        object.__setattr__(self, "history", tuple(self.history or ()))
-        object.__setattr__(self, "report", dict(self.report or {}))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(
+            self,
+            "history",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    tuple(self.history or ()), path="solver_result.history"
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "report",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    dict(self.report or {}), path="solver_result.report"
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_shared_value(
+                _encode_shared_value(
+                    dict(self.metadata or {}), path="solver_result.metadata"
+                )
+            ),
+        )
         object.__setattr__(self, "best_solution_ref", _coerce_data_ref(self.best_solution_ref))
         object.__setattr__(self, "pareto_front_ref", _coerce_data_ref(self.pareto_front_ref))
         object.__setattr__(self, "history_ref", _coerce_data_ref(self.history_ref))
@@ -899,7 +1054,7 @@ class SolverResult:
             if ref is None:
                 raise TypeError(f"artifact_refs['{key}'] must be a DataRef")
             artifact_refs[str(key)] = ref
-        object.__setattr__(self, "artifact_refs", artifact_refs)
+        object.__setattr__(self, "artifact_refs", MappingProxyType(artifact_refs))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -921,6 +1076,12 @@ class SolverResult:
                 None if self.best_objectives is None else self.best_objectives.tolist()
             ),
             "best_constraint_violation": self.best_constraint_violation,
+            "best_candidate_token": self.best_candidate_token,
+            "best_evaluation_id": self.best_evaluation_id,
+            "best_provenance": _encode_shared_value(
+                self.best_provenance,
+                path="solver_result.best_provenance",
+            ),
             "solve_status": self.solve_status,
             "termination_reason": self.termination_reason,
             "feasibility": self.feasibility,
@@ -976,6 +1137,11 @@ class SolverResult:
                 None
                 if data.get("best_constraint_violation") is None
                 else float(data.get("best_constraint_violation"))
+            ),
+            best_candidate_token=data.get("best_candidate_token"),
+            best_evaluation_id=data.get("best_evaluation_id"),
+            best_provenance=dict(
+                _decode_shared_value(data.get("best_provenance", {})) or {}
             ),
             solve_status=str(data.get("solve_status", "unknown")),
             termination_reason=str(data.get("termination_reason", "unknown")),

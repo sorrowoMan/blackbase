@@ -7,7 +7,7 @@ and kernel components shared between optimization and machine learning framework
 
 from __future__ import annotations
 
-__version__ = "0.3.9"
+__version__ = "0.3.24"
 
 from . import context
 from . import resources
@@ -37,6 +37,12 @@ from .types import (
     encode_shared_value,
 )
 from .state_ref import StateRef
+from .selection import normalize_row_selector
+from .evaluation import (
+    EvaluationEvidenceJournal,
+    EvaluationEvidenceRecord,
+    EvaluationEventEnvelope,
+)
 from .catalog import (
     Catalog,
     CatalogEntry,
@@ -71,6 +77,10 @@ __all__ = [
     "Feedback",
     "CandidateBatch",
     "StateRef",
+    "EvaluationEventEnvelope",
+    "EvaluationEvidenceJournal",
+    "EvaluationEvidenceRecord",
+    "normalize_row_selector",
     "encode_shared_value",
     "decode_shared_value",
     "UnknownState",

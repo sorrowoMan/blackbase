@@ -38,6 +38,15 @@ python -m blackbase.project.external_worker `
 `redis_url` 可能包含凭据，因此 Project 的 check 输出和 manifest 只记录 backend 与
 namespace，不回显 URL。部署时应通过受控配置注入 URL，不要把生产凭据提交到仓库。
 
+本机开发应使用仓库中的受限监听配置：
+
+```powershell
+docker compose -f compose.redis.local.yml up -d
+```
+
+它只发布 `127.0.0.1:6379`。跨主机部署必须另行启用 ACL、TLS/私网和防火墙来源限制；
+不得把无认证的 `6379:6379` 暴露到所有主机网卡。
+
 ## Redis Project L0 authority
 
 `RedisTaskTransport` 只负责任务 broker；跨机器资源预算与结果 fencing 由独立的

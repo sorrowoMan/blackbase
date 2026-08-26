@@ -248,6 +248,7 @@ class StateReleaseRequest:
     scope_id: str = ""
     trajectory_id: str = ""
     state_kinds: tuple[str, ...] = ()
+    state_ids: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     request_id: str = field(default_factory=lambda: f"release_{uuid4().hex}")
 
@@ -273,11 +274,23 @@ class StateReleaseRequest:
         )
         if len(kinds) > EVALUATION_DECLARATION_MAX_ITEMS:
             raise ValueError("StateReleaseRequest.state_kinds has too many items")
+        state_ids = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in tuple(self.state_ids or ())
+                if str(value or "").strip()
+            )
+        )
+        if len(state_ids) > EVALUATION_DECLARATION_MAX_ITEMS:
+            raise ValueError("StateReleaseRequest.state_ids has too many items")
+        if any(len(value) > EVALUATION_IDENTIFIER_MAX_LENGTH for value in state_ids):
+            raise ValueError("StateReleaseRequest.state_ids contains an identifier that is too long")
         object.__setattr__(self, "provider_id", provider_id)
         object.__setattr__(self, "request_id", request_id)
         object.__setattr__(self, "scope_id", scope_id)
         object.__setattr__(self, "trajectory_id", trajectory_id)
         object.__setattr__(self, "state_kinds", kinds)
+        object.__setattr__(self, "state_ids", state_ids)
         object.__setattr__(
             self,
             "metadata",
@@ -293,6 +306,7 @@ class StateReleaseRequest:
             "scope_id": self.scope_id,
             "trajectory_id": self.trajectory_id,
             "state_kinds": list(self.state_kinds),
+            "state_ids": list(self.state_ids),
             "metadata": thaw_wire_value(self.metadata),
         }
 
@@ -305,6 +319,7 @@ class StateReleaseRequest:
             scope_id=str(data.get("scope_id", "")),
             trajectory_id=str(data.get("trajectory_id", "")),
             state_kinds=tuple(data.get("state_kinds", ()) or ()),
+            state_ids=tuple(data.get("state_ids", ()) or ()),
             metadata=dict(decode_shared_value(data.get("metadata", {})) or {}),
         )
 
@@ -318,6 +333,7 @@ class StateReleaseResult:
     status: str
     released_count: int = 0
     released_state_ids: tuple[str, ...] = ()
+    not_found_state_ids: tuple[str, ...] = ()
     binding: EvaluationBinding | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -336,8 +352,21 @@ class StateReleaseResult:
         if released_count < 0:
             raise ValueError("StateReleaseResult.released_count must be non-negative")
         ids = tuple(str(value) for value in tuple(self.released_state_ids or ()))
+        not_found_ids = tuple(
+            str(value) for value in tuple(self.not_found_state_ids or ())
+        )
         if len(ids) > EVALUATION_DECLARATION_MAX_ITEMS:
             raise ValueError("StateReleaseResult.released_state_ids has too many items")
+        if len(not_found_ids) > EVALUATION_DECLARATION_MAX_ITEMS:
+            raise ValueError("StateReleaseResult.not_found_state_ids has too many items")
+        if len(set(ids)) != len(ids) or len(set(not_found_ids)) != len(not_found_ids):
+            raise ValueError("StateReleaseResult state ids must be unique")
+        if set(ids).intersection(not_found_ids):
+            raise ValueError("released and not-found StateRef ids must be disjoint")
+        if released_count != len(ids):
+            raise ValueError(
+                "StateReleaseResult.released_count must match released_state_ids"
+            )
         if status == "not_found" and released_count != 0:
             raise ValueError("not_found release cannot report released states")
         if status == "released" and released_count <= 0:
@@ -352,6 +381,7 @@ class StateReleaseResult:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "released_count", released_count)
         object.__setattr__(self, "released_state_ids", ids)
+        object.__setattr__(self, "not_found_state_ids", not_found_ids)
         object.__setattr__(self, "binding", binding)
         object.__setattr__(
             self,
@@ -373,6 +403,7 @@ class StateReleaseResult:
             "status": self.status,
             "released_count": self.released_count,
             "released_state_ids": list(self.released_state_ids),
+            "not_found_state_ids": list(self.not_found_state_ids),
             "binding": None if self.binding is None else self.binding.as_dict(),
             "metadata": thaw_wire_value(self.metadata),
         }
@@ -386,6 +417,9 @@ class StateReleaseResult:
             status=str(data.get("status", "")),
             released_count=int(data.get("released_count", 0) or 0),
             released_state_ids=tuple(data.get("released_state_ids", ()) or ()),
+            not_found_state_ids=tuple(
+                data.get("not_found_state_ids", ()) or ()
+            ),
             binding=(
                 None
                 if data.get("binding") is None
@@ -399,9 +433,11 @@ class StateReleaseResult:
 class StateTransitionRequest:
     """Algorithm-selected state update to execute inside the owner Provider.
 
-    Typical operands are ``gradient`` or ``direction``.  Stateful compute
+    Typical operands are ``gradient`` or ``direction``. Stateful compute
     kernels can receive prior optimizer slots through ``slot_refs`` and return
-    their successor slots in :class:`StateTransitionResult`.
+    their successor slots in :class:`StateTransitionResult`. Applied slot
+    transitions are copy-on-write: a successor slot must have a new ``state_id``
+    so the caller can commit or abort without destroying its predecessor.
     """
 
     state_ref: StateRef

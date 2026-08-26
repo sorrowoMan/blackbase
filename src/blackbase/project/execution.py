@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from blackbase.resources import BudgetHandle, CancellationRef, DataRef, TerminationPolicy
+from blackbase.resources import (
+    ArtifactBinding,
+    ArtifactPublicationReceipt,
+    BudgetHandle,
+    CancellationRef,
+    DataRef,
+    TerminationPolicy,
+)
 from blackbase.wire import freeze_wire_mapping, thaw_wire_mapping
 
 
-CASE_RUN_SCHEMA_VERSION = 1
+CASE_RUN_SCHEMA_VERSION = 3
 CASE_RUN_STATUSES = frozenset(
     {
         "pending",
@@ -117,7 +125,7 @@ class CaseRunIdentity:
 
 @dataclass(frozen=True)
 class ExecutionControl:
-    """Serializable absolute deadline and cancellation lineage."""
+    """Fixed-size online cancellation control with durable lineage authority."""
 
     cancellation: CancellationRef = field(default_factory=CancellationRef)
     ancestor_cancellations: tuple[CancellationRef, ...] = ()
@@ -134,6 +142,11 @@ class ExecutionControl:
             item if isinstance(item, CancellationRef) else CancellationRef.from_dict(item)
             for item in tuple(self.ancestor_cancellations or ())
         )
+        if ancestors:
+            raise ValueError(
+                "ExecutionControl no longer transports ancestor references; "
+                "use CancellationRef.parent_control_id and the durable authority"
+            )
         termination = (
             self.termination
             if isinstance(self.termination, TerminationPolicy)
@@ -153,12 +166,7 @@ class ExecutionControl:
 
     @property
     def deadline_at(self) -> float:
-        deadlines = [
-            ref.deadline_at
-            for ref in (*self.ancestor_cancellations, self.cancellation)
-            if ref.deadline_at > 0
-        ]
-        return min(deadlines) if deadlines else 0.0
+        return self.cancellation.deadline_at
 
     @classmethod
     def with_timeout(
@@ -169,6 +177,9 @@ class ExecutionControl:
         namespace: str = "blackbase",
         path: str = "",
         redis_url_env: str = "BLACKBASE_REDIS_URL",
+        active_ttl_seconds: float = 0.0,
+        heartbeat_seconds: float = 0.0,
+        retention_seconds: float = 0.0,
         termination: TerminationPolicy | Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "ExecutionControl":
@@ -183,6 +194,9 @@ class ExecutionControl:
                 path=path,
                 redis_url_env=redis_url_env,
                 deadline_at=deadline,
+                active_ttl_seconds=active_ttl_seconds,
+                heartbeat_seconds=heartbeat_seconds,
+                retention_seconds=retention_seconds,
             ),
             termination=(
                 termination
@@ -199,11 +213,11 @@ class ExecutionControl:
         intermediate_cancellations: Sequence[CancellationRef] = (),
     ) -> "ExecutionControl":
         if isinstance(child, ExecutionControl):
-            cancellation = child.cancellation
+            child_cancellation = child.cancellation
             termination = child.termination
             child_metadata = dict(child.metadata)
         else:
-            cancellation = child
+            child_cancellation = child
             termination = self.termination
             child_metadata = {}
         intermediates = tuple(
@@ -212,18 +226,82 @@ class ExecutionControl:
             else CancellationRef.from_dict(item)
             for item in tuple(intermediate_cancellations or ())
         )
+        expected_parent = self.cancellation
+        for intermediate in intermediates:
+            if (
+                intermediate.backend != self.cancellation.backend
+                or intermediate.namespace != self.cancellation.namespace
+                or intermediate.path != self.cancellation.path
+            ):
+                raise ValueError(
+                    "intermediate cancellation must use the parent authority"
+                )
+            expected_digest = hashlib.sha256(
+                (
+                    f"{expected_parent.lineage_digest}:"
+                    f"{expected_parent.control_id}:{intermediate.control_id}"
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                intermediate.parent_control_id != expected_parent.control_id
+                or intermediate.root_control_id
+                != (expected_parent.root_control_id or expected_parent.control_id)
+                or intermediate.lineage_depth != expected_parent.lineage_depth + 1
+                or intermediate.lineage_digest != expected_digest
+            ):
+                raise ValueError(
+                    "intermediate cancellation does not extend the parent lineage"
+                )
+            expected_parent = intermediate
+        parent_ref = expected_parent
+        if child_cancellation.control_id in {
+            self.cancellation.control_id,
+            self.cancellation.root_control_id,
+            *(item.control_id for item in intermediates),
+        }:
+            raise ValueError("child cancellation control_id would create a lineage cycle")
+        child_deadlines = [
+            value
+            for value in (parent_ref.deadline_at, child_cancellation.deadline_at)
+            if value > 0
+        ]
+        effective_deadline = min(child_deadlines) if child_deadlines else 0.0
+        lineage_depth = int(parent_ref.lineage_depth) + 1
+        lineage_digest = hashlib.sha256(
+            (
+                f"{parent_ref.lineage_digest}:"
+                f"{parent_ref.control_id}:{child_cancellation.control_id}"
+            ).encode("utf-8")
+        ).hexdigest()
+        cancellation = CancellationRef(
+            control_id=child_cancellation.control_id,
+            backend=parent_ref.backend,
+            namespace=parent_ref.namespace,
+            path=parent_ref.path,
+            redis_url_env=parent_ref.redis_url_env,
+            deadline_at=effective_deadline,
+            created_at=child_cancellation.created_at,
+            parent_control_id=parent_ref.control_id,
+            root_control_id=(
+                parent_ref.root_control_id or parent_ref.control_id
+            ),
+            lineage_depth=lineage_depth,
+            lineage_digest=lineage_digest,
+            active_ttl_seconds=parent_ref.active_ttl_seconds,
+            heartbeat_seconds=parent_ref.heartbeat_seconds,
+            retention_seconds=parent_ref.retention_seconds,
+        )
         return ExecutionControl(
             cancellation=cancellation,
-            ancestor_cancellations=(
-                *self.ancestor_cancellations,
-                self.cancellation,
-                *intermediates,
-            ),
+            ancestor_cancellations=(),
             termination=termination,
             metadata={
                 **dict(self.metadata),
                 **child_metadata,
                 "parent_control_id": self.cancellation.control_id,
+                "lineage_root_control_id": cancellation.root_control_id,
+                "lineage_depth": cancellation.lineage_depth,
+                "lineage_digest": cancellation.lineage_digest,
                 "intermediate_control_ids": [
                     item.control_id for item in intermediates
                 ],
@@ -370,6 +448,8 @@ class CaseFailure:
         retryable: bool = False,
         details: Mapping[str, Any] | None = None,
     ) -> "CaseFailure":
+        failure_details = collect_failure_evidence(exc)
+        failure_details.update(dict(details or {}))
         if isinstance(exc, CaseInvocationError):
             result = exc.result
             child_failure = result.failure
@@ -386,7 +466,6 @@ class CaseFailure:
                     "details": {},
                 }
             )
-            failure_details = dict(details or {})
             failure_details["child_case"] = {
                 "identity": result.identity.as_dict(),
                 "project_name": result.request.project_name,
@@ -413,7 +492,7 @@ class CaseFailure:
             message=str(exc),
             phase=phase,
             retryable=retryable,
-            details=dict(details or {}),
+            details=failure_details,
         )
 
     @classmethod
@@ -443,6 +522,37 @@ class CaseFailure:
         }
 
 
+_FAILURE_EVIDENCE_ATTR = "_blackbase_failure_evidence"
+
+
+def attach_failure_evidence(
+    exc: BaseException,
+    key: str,
+    evidence: Any,
+) -> BaseException:
+    """Attach one formally serializable evidence field to an exception.
+
+    ``CaseFailure.from_exception`` is the transport boundary and consumes this
+    public carrier.  Callers should not rely on arbitrary exception attributes
+    surviving a Case/process boundary.
+    """
+
+    name = str(key or "").strip()
+    if not name:
+        raise ValueError("failure evidence key must be non-empty")
+    current = dict(getattr(exc, _FAILURE_EVIDENCE_ATTR, {}) or {})
+    current[name] = evidence
+    setattr(exc, _FAILURE_EVIDENCE_ATTR, current)
+    return exc
+
+
+def collect_failure_evidence(exc: BaseException) -> dict[str, Any]:
+    """Return detached formal evidence carried by ``exc``."""
+
+    raw = getattr(exc, _FAILURE_EVIDENCE_ATTR, {})
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
 @dataclass(frozen=True)
 class CaseRunRequest:
     """Complete transport-safe request for one standard Case invocation."""
@@ -461,6 +571,7 @@ class CaseRunRequest:
     budget_handles: Mapping[str, BudgetHandle] = field(default_factory=dict)
     component_overrides: Mapping[str, Any] = field(default_factory=dict)
     input_artifacts: Mapping[str, DataRef] = field(default_factory=dict)
+    input_artifact_bindings: Mapping[str, ArtifactBinding] = field(default_factory=dict)
     inputs: Mapping[str, Any] = field(default_factory=dict)
     argv: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -492,6 +603,23 @@ class CaseRunRequest:
             str(key): value if isinstance(value, DataRef) else DataRef.from_dict(value)
             for key, value in dict(self.input_artifacts or {}).items()
         }
+        bindings = {
+            str(key): (
+                value
+                if isinstance(value, ArtifactBinding)
+                else ArtifactBinding.from_dict(value)
+            )
+            for key, value in dict(self.input_artifact_bindings or {}).items()
+        }
+        if refs and not bindings:
+            raise ValueError(
+                "formal input_artifacts require authority-issued ArtifactBinding values; "
+                "put ordinary DataRef values in request.inputs instead"
+            )
+        bound_refs = {key: binding.ref for key, binding in bindings.items()}
+        if refs and refs != bound_refs:
+            raise ValueError("input_artifacts do not match input_artifact_bindings")
+        refs = bound_refs
         object.__setattr__(self, "project_name", str(self.project_name))
         object.__setattr__(self, "stage_name", str(self.stage_name))
         object.__setattr__(self, "case_name", str(self.case_name))
@@ -544,6 +672,11 @@ class CaseRunRequest:
         object.__setattr__(self, "input_artifacts", MappingProxyType(refs))
         object.__setattr__(
             self,
+            "input_artifact_bindings",
+            MappingProxyType(bindings),
+        )
+        object.__setattr__(
+            self,
             "inputs",
             freeze_wire_mapping(
                 _transport_safe(self.inputs, path="request.inputs"),
@@ -567,7 +700,9 @@ class CaseRunRequest:
         if schema_version != CASE_RUN_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported CaseRunRequest schema_version={schema_version}; "
-                f"expected {CASE_RUN_SCHEMA_VERSION}"
+                f"expected {CASE_RUN_SCHEMA_VERSION}. Live older requests cannot be "
+                "upgraded because they do not carry the current cancellation and "
+                "Artifact authority bindings; upgrade every worker before dispatch"
             )
         raw_grant = payload.get("child_grant")
         return cls(
@@ -597,6 +732,12 @@ class CaseRunRequest:
             input_artifacts={
                 str(key): DataRef.from_dict(value)
                 for key, value in dict(payload.get("input_artifacts", {}) or {}).items()
+            },
+            input_artifact_bindings={
+                str(key): ArtifactBinding.from_dict(value)
+                for key, value in dict(
+                    payload.get("input_artifact_bindings", {}) or {}
+                ).items()
             },
             inputs=dict(payload.get("inputs", {}) or {}),
             argv=tuple(payload.get("argv", ()) or ()),
@@ -631,6 +772,10 @@ class CaseRunRequest:
             "input_artifacts": {
                 key: ref.as_dict() for key, ref in self.input_artifacts.items()
             },
+            "input_artifact_bindings": {
+                key: binding.as_dict()
+                for key, binding in self.input_artifact_bindings.items()
+            },
             "inputs": _transport_safe(self.inputs, path="request.inputs"),
             "argv": list(self.argv),
             "metadata": _transport_safe(self.metadata, path="request.metadata"),
@@ -645,6 +790,13 @@ class CaseRunResult:
     status: str
     output: Mapping[str, Any] = field(default_factory=dict)
     artifact_refs: Mapping[str, DataRef] = field(default_factory=dict)
+    artifact_publications: Mapping[str, ArtifactPublicationReceipt] = field(
+        default_factory=dict
+    )
+    diagnostic_artifact_refs: Mapping[str, DataRef] = field(default_factory=dict)
+    diagnostic_artifact_publications: Mapping[
+        str, ArtifactPublicationReceipt
+    ] = field(default_factory=dict)
     resource_usage: Mapping[str, Any] = field(default_factory=dict)
     budget_usage: Mapping[str, Any] = field(default_factory=dict)
     started_at: float = 0.0
@@ -668,9 +820,31 @@ class CaseRunResult:
         status = str(self.status or "pending").strip().lower()
         if status not in CASE_RUN_STATUSES:
             raise ValueError(f"unsupported CaseRunResult status '{status}'")
-        refs = {
+        supplied_refs = {
             str(key): value if isinstance(value, DataRef) else DataRef.from_dict(value)
             for key, value in dict(self.artifact_refs or {}).items()
+        }
+        publications = {
+            str(key): (
+                value
+                if isinstance(value, ArtifactPublicationReceipt)
+                else ArtifactPublicationReceipt.from_dict(value)
+            )
+            for key, value in dict(self.artifact_publications or {}).items()
+        }
+        diagnostic_refs = {
+            str(key): value if isinstance(value, DataRef) else DataRef.from_dict(value)
+            for key, value in dict(self.diagnostic_artifact_refs or {}).items()
+        }
+        diagnostic_publications = {
+            str(key): (
+                value
+                if isinstance(value, ArtifactPublicationReceipt)
+                else ArtifactPublicationReceipt.from_dict(value)
+            )
+            for key, value in dict(
+                self.diagnostic_artifact_publications or {}
+            ).items()
         }
         failure = self.failure
         if failure is not None and not isinstance(failure, CaseFailure):
@@ -680,6 +854,32 @@ class CaseRunResult:
         elapsed = max(0.0, float(self.elapsed_seconds or 0.0))
         if started > 0 and finished > 0:
             elapsed = max(0.0, finished - started)
+        succeeded = (
+            int(self.exit_code or 0) == 0
+            and status in CASE_RUN_SUCCESS_STATUSES
+            and failure is None
+        )
+        formal_refs: dict[str, DataRef] = {}
+        formal_publications: dict[str, ArtifactPublicationReceipt] = {}
+        for name, receipt in publications.items():
+            if receipt.project_run_id != request.identity.project_run_id:
+                raise ValueError(
+                    f"Artifact publication '{name}' is outside the Case run lineage"
+                )
+            supplied = supplied_refs.get(name)
+            if supplied is not None and supplied != receipt.ref:
+                raise ValueError(
+                    f"Artifact publication '{name}' disagrees with its DataRef"
+                )
+            if succeeded:
+                formal_refs[name] = receipt.ref
+                formal_publications[name] = receipt
+            else:
+                diagnostic_refs[name] = receipt.ref
+                diagnostic_publications[name] = receipt
+        for name, ref in supplied_refs.items():
+            if name not in formal_refs:
+                diagnostic_refs.setdefault(name, ref)
         object.__setattr__(self, "request", request)
         object.__setattr__(self, "status", status)
         object.__setattr__(
@@ -690,7 +890,22 @@ class CaseRunResult:
                 path="result.output",
             ),
         )
-        object.__setattr__(self, "artifact_refs", MappingProxyType(refs))
+        object.__setattr__(self, "artifact_refs", MappingProxyType(formal_refs))
+        object.__setattr__(
+            self,
+            "artifact_publications",
+            MappingProxyType(formal_publications),
+        )
+        object.__setattr__(
+            self,
+            "diagnostic_artifact_refs",
+            MappingProxyType(diagnostic_refs),
+        )
+        object.__setattr__(
+            self,
+            "diagnostic_artifact_publications",
+            MappingProxyType(diagnostic_publications),
+        )
         object.__setattr__(
             self,
             "resource_usage",
@@ -757,7 +972,9 @@ class CaseRunResult:
         if schema_version != CASE_RUN_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported CaseRunResult schema_version={schema_version}; "
-                f"expected {CASE_RUN_SCHEMA_VERSION}"
+                f"expected {CASE_RUN_SCHEMA_VERSION}. Historical v1 results are "
+                "migrated only through ProjectRunManifest resume; live worker "
+                "results require a stack-wide worker upgrade"
             )
         raw_failure = payload.get("failure")
         return cls(
@@ -767,6 +984,24 @@ class CaseRunResult:
             artifact_refs={
                 str(key): DataRef.from_dict(value)
                 for key, value in dict(payload.get("artifact_refs", {}) or {}).items()
+            },
+            artifact_publications={
+                str(key): ArtifactPublicationReceipt.from_dict(value)
+                for key, value in dict(
+                    payload.get("artifact_publications", {}) or {}
+                ).items()
+            },
+            diagnostic_artifact_refs={
+                str(key): DataRef.from_dict(value)
+                for key, value in dict(
+                    payload.get("diagnostic_artifact_refs", {}) or {}
+                ).items()
+            },
+            diagnostic_artifact_publications={
+                str(key): ArtifactPublicationReceipt.from_dict(value)
+                for key, value in dict(
+                    payload.get("diagnostic_artifact_publications", {}) or {}
+                ).items()
             },
             resource_usage=dict(payload.get("resource_usage", {}) or {}),
             budget_usage=dict(payload.get("budget_usage", {}) or {}),
@@ -793,6 +1028,18 @@ class CaseRunResult:
             "output": _transport_safe(self.output, path="result.output"),
             "artifact_refs": {
                 key: ref.as_dict() for key, ref in self.artifact_refs.items()
+            },
+            "artifact_publications": {
+                key: receipt.as_dict()
+                for key, receipt in self.artifact_publications.items()
+            },
+            "diagnostic_artifact_refs": {
+                key: ref.as_dict()
+                for key, ref in self.diagnostic_artifact_refs.items()
+            },
+            "diagnostic_artifact_publications": {
+                key: receipt.as_dict()
+                for key, receipt in self.diagnostic_artifact_publications.items()
             },
             "resource_usage": _transport_safe(
                 self.resource_usage, path="result.resource_usage"
@@ -839,6 +1086,7 @@ class ProjectRunResult:
     group: str
     case_results: Sequence[CaseRunResult] = ()
     artifact_registry: Mapping[str, DataRef] = field(default_factory=dict)
+    artifact_bindings: Mapping[str, ArtifactBinding] = field(default_factory=dict)
     status: str = "ok"
     exit_code: int = 0
     run_id: str = ""
@@ -853,6 +1101,26 @@ class ProjectRunResult:
             self,
             "artifact_registry",
             MappingProxyType(dict(self.artifact_registry or {})),
+        )
+        bindings = {
+            str(key): (
+                value
+                if isinstance(value, ArtifactBinding)
+                else ArtifactBinding.from_dict(value)
+            )
+            for key, value in dict(self.artifact_bindings or {}).items()
+        }
+        if dict(self.artifact_registry or {}) != {
+            key: binding.ref for key, binding in bindings.items()
+        }:
+            raise ValueError(
+                "ProjectRunResult artifact_registry must be the DataRef view of "
+                "artifact_bindings"
+            )
+        object.__setattr__(
+            self,
+            "artifact_bindings",
+            MappingProxyType(bindings),
         )
         object.__setattr__(self, "status", str(self.status or "unknown"))
         object.__setattr__(self, "exit_code", int(self.exit_code or 0))
@@ -877,6 +1145,10 @@ class ProjectRunResult:
             "cases": [item.as_dict() for item in self.case_results],
             "artifact_registry": {
                 key: ref.as_dict() for key, ref in self.artifact_registry.items()
+            },
+            "artifact_bindings": {
+                key: binding.as_dict()
+                for key, binding in self.artifact_bindings.items()
             },
         }
 

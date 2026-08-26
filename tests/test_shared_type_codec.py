@@ -83,6 +83,9 @@ def test_shared_solver_result_codec_round_trips_pareto_and_refs() -> None:
         best_solution=best,
         best_objectives=[0.2, 0.8],
         best_constraint_violation=0.0,
+        best_candidate_token="candidate-7",
+        best_evaluation_id="evaluation-9",
+        best_provenance={"source": {"kind": "warm_start"}},
         pareto_front=pareto,
         solve_status="feasible",
         termination_reason="iteration_limit",
@@ -107,6 +110,9 @@ def test_shared_solver_result_codec_round_trips_pareto_and_refs() -> None:
     assert isinstance(restored.pareto_front, PopulationSnapshot)
     assert np.allclose(restored.best_objectives, [0.2, 0.8])
     assert restored.best_constraint_violation == 0.0
+    assert restored.best_candidate_token == "candidate-7"
+    assert restored.best_evaluation_id == "evaluation-9"
+    assert restored.best_provenance["source"]["kind"] == "warm_start"
     assert restored.solve_status == "feasible"
     assert restored.termination_reason == "iteration_limit"
     assert restored.feasibility == "feasible"
@@ -258,3 +264,45 @@ def test_solver_result_allows_failed_result_with_pre_failure_incumbent() -> None
 
     assert result.solve_status == "failed"
     assert result.feasibility == "feasible"
+
+
+def test_shared_result_payloads_are_recursively_immutable() -> None:
+    ref = DataRef(uri="artifact://immutable", checksum="sha256:" + "a" * 64)
+    trainer = TrainerResult(
+        best_objectives=[1.0],
+        history=({"nested": {"score": 1}},),
+        report={"nested": {"score": 1}},
+        metadata={"labels": ["a", "b"]},
+        artifact_refs={"model": ref},
+    )
+    solver = SolverResult(
+        best_objectives=[1.0],
+        best_provenance={"nested": {"source": "proposal"}},
+        history=({"nested": {"score": 1}},),
+        report={"nested": {"score": 1}},
+        metadata={"labels": ["a", "b"]},
+        quality=SolveQuality(metrics={"nested": {"gap": 0.1}}),
+        artifact_refs={"trace": ref},
+    )
+
+    with pytest.raises(ValueError):
+        trainer.best_objectives[0] = 9.0
+    with pytest.raises(TypeError):
+        trainer.report["nested"]["score"] = 9
+    with pytest.raises(TypeError):
+        trainer.history[0]["nested"]["score"] = 9
+    with pytest.raises(TypeError):
+        trainer.artifact_refs["other"] = ref
+    with pytest.raises(ValueError):
+        solver.best_objectives[0] = 9.0
+    with pytest.raises(TypeError):
+        solver.best_provenance["nested"]["source"] = "rewritten"
+    with pytest.raises(TypeError):
+        solver.quality.metrics["nested"]["gap"] = 9.0
+    with pytest.raises(TypeError):
+        solver.metadata["labels"] += ("c",)
+
+
+def test_solve_quality_rejects_non_finite_bound() -> None:
+    with pytest.raises(ValueError, match="bound must be finite"):
+        SolveQuality(bound=float("nan"))

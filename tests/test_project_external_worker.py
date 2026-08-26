@@ -8,12 +8,13 @@ import threading
 import time
 
 from blackbase.project.external_worker import ExternalCaseWorker
-from blackbase.project import CaseRunRequest, CaseRunResult
+from blackbase.project import CaseRunRequest, CaseRunResult, ExecutionControl
 from blackbase.project.doctor import run_common_project_doctor
 from blackbase.project.project_runner import execute_project
 from blackbase.project.run_manifest import ProjectRunRecorder, project_config_fingerprint
 from blackbase.project.scaffold import add_case, create_project
 from blackbase.resources import (
+    CancellationRef,
     ResourceOffer,
     ResourceAllocator,
     ResourcePolicy,
@@ -264,6 +265,13 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                 "capabilities": [],
             },
         },
+        control=ExecutionControl(
+            cancellation=CancellationRef(
+                backend="sqlite",
+                path=str(project_root / ".blackbase" / "controls.sqlite"),
+                namespace="retry_identity",
+            )
+        ),
     )
     transport.submit(
         TaskEnvelope(
@@ -462,7 +470,12 @@ def test_project_resume_reconciles_submit_before_manifest_crash_window(tmp_path)
         result.case_results[0].request.as_dict()["resource_context"]
         == old_resource_context
     )
-    assert result.artifact_registry["external.external_case.report"].uri == "memory://recovered/report"
+    assert "external.external_case.report" not in result.artifact_registry
+    assert result.case_results[0].artifact_refs == {}
+    assert (
+        result.case_results[0].diagnostic_artifact_refs["report"].uri
+        == "memory://recovered/report"
+    )
     assert transport.counts() == {"succeeded": 1}
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
     assert manifest["cases"][0]["external_task"]["task_id"] == task_id
@@ -546,6 +559,13 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                     case_name="external_case",
                     resource_request=ResourceRequest(workers=1, threads=1).as_dict(),
                     resource_context=resource_context,
+                    control=ExecutionControl(
+                        cancellation=CancellationRef(
+                            backend="sqlite",
+                            path=str(project_root / ".blackbase" / "controls.sqlite"),
+                            namespace="external_project",
+                        )
+                    ),
                 ).as_dict(),
                 "extra_python_paths": [],
             },

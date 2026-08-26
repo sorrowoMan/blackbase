@@ -181,6 +181,19 @@ def test_state_release_requires_the_exact_authoritative_scope() -> None:
         StateReleaseRequest(provider_id="provider/v1", trajectory_id="trajectory")
 
 
+def test_state_release_roundtrips_targeted_state_ids() -> None:
+    request = StateReleaseRequest(
+        provider_id="provider/v1",
+        scope_id="case.fit",
+        trajectory_id="trajectory",
+        state_ids=("slot-m", "slot-v", "slot-m"),
+    )
+
+    restored = StateReleaseRequest.from_dict(request.as_dict())
+
+    assert restored.state_ids == ("slot-m", "slot-v")
+
+
 def test_provider_cannot_mutate_materialization_request_after_binding() -> None:
     class MutatingProvider:
         spec = EvaluationProviderSpec(

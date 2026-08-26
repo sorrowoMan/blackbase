@@ -11,6 +11,7 @@ from .check_output import (
     print_resource_context_summary,
 )
 from .doctor import DoctorDiagnostic, DoctorReport, format_doctor_report, run_common_project_doctor
+from .dag import DAG_STAGE_SCHEMA_VERSION, DagStagePlan
 from .execution import (
     CASE_RUN_SCHEMA_VERSION,
     CaseFailure,
@@ -22,8 +23,15 @@ from .execution import (
     ExecutionControl,
     ProjectConfigurationError,
     ProjectRunResult,
+    attach_failure_evidence,
+    collect_failure_evidence,
 )
-from .invocation import CaseExecutor, CaseInvoker, CaseRuntimeContext
+from .invocation import (
+    ArtifactPublicationTransaction,
+    CaseExecutor,
+    CaseInvoker,
+    CaseRuntimeContext,
+)
 from .case_stages import CaseStage, CaseStageResult, CaseStageRunner, ChildCaseCall
 from .case_binding import (
     CASE_RESOURCE_BINDING_SCHEMA_VERSION,
@@ -66,6 +74,7 @@ __all__ = [
     "CaseRunRequest",
     "CaseRunResult",
     "CaseRuntimeContext",
+    "ArtifactPublicationTransaction",
     "CaseResourceBindingAudit",
     "CaseStage",
     "CaseStageResult",
@@ -75,12 +84,16 @@ __all__ = [
     "ChildCaseCall",
     "DoctorDiagnostic",
     "DoctorReport",
+    "DAG_STAGE_SCHEMA_VERSION",
+    "DagStagePlan",
     "ProjectL0Runtime",
     "ProjectConfigurationError",
     "ProjectRunResult",
     "ProjectRunManifest",
     "ProjectRunRecorder",
     "ProjectRuntimeConfig",
+    "attach_failure_evidence",
+    "collect_failure_evidence",
     "ExecutionControl",
     "ResourceLeaseFenceError",
     "ResourceLeaseGuard",

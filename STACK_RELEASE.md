@@ -5,10 +5,10 @@
 
 当前发布顺序固定为：
 
-1. `blackbase 0.3.9`
-2. `nsgablack 0.3.11`，要求 `blackbase>=0.3.9,<0.4.0`
-3. `mlblack 0.4.8`，要求 `blackbase>=0.3.9,<0.4.0` 与
-   `nsgablack>=0.3.11,<0.4.0`
+1. `blackbase 0.3.24`
+2. `nsgablack 0.3.26`，要求 `blackbase>=0.3.24,<0.4.0`
+3. `mlblack 0.4.22`，要求 `blackbase>=0.3.24,<0.4.0` 与
+   `nsgablack>=0.3.26,<0.4.0`
 
 每一层只有在以下条件全部成立后才能发布下一层：
 

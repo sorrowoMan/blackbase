@@ -4,9 +4,31 @@ import pickle
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from blackbase.context import ContextStore, RedisContextStore, StateStoreConfig
+from blackbase.context import (
+    ContextStore,
+    RedisContextStore,
+    RedisValueCodecError,
+    StateStoreConfig,
+)
+from blackbase.resources import DataRef
+from blackbase.state_ref import StateRef
+
+
+_PICKLE_EXECUTED = False
+
+
+def _mark_pickle_executed():
+    global _PICKLE_EXECUTED
+    _PICKLE_EXECUTED = True
+    return "executed"
+
+
+class _MaliciousPickle:
+    def __reduce__(self):
+        return (_mark_pickle_executed, ())
 
 
 class _FakeRedisPipeline:
@@ -50,6 +72,19 @@ class _FakeRedis:
         self.pipeline_requests.append(pipeline)
         return pipeline
 
+    def scan_iter(self, *, match, count):
+        del count
+        prefix = str(match).removesuffix("*")
+        return iter(
+            key.encode("utf-8")
+            for key in sorted(self.values)
+            if key.startswith(prefix)
+        )
+
+    def get(self, key):
+        normalized = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        return self.values.get(normalized)
+
 
 def test_state_store_config_validates_limits_and_returns_detached_payload() -> None:
     config = StateStoreConfig(
@@ -65,6 +100,13 @@ def test_state_store_config_validates_limits_and_returns_detached_payload() -> N
     assert config.context_inline_candidate_max_bytes == 512
     with pytest.raises(ValueError, match="must be positive"):
         StateStoreConfig(snapshot_store_max_payload_bytes=0)
+    with pytest.raises(ValueError, match="must be one of"):
+        StateStoreConfig(context_store_serializer="unknown")
+    with pytest.raises(ValueError, match="cannot enable legacy pickle"):
+        StateStoreConfig(
+            context_store_serializer="safe",
+            context_store_unsafe_allow_legacy_pickle=True,
+        )
 
 
 def test_in_memory_context_patch_sets_and_deletes_as_one_backend_operation() -> None:
@@ -92,7 +134,7 @@ def test_redis_context_patch_pre_serializes_before_transaction(monkeypatch) -> N
         SimpleNamespace(from_url=lambda _url: fake),
     )
     store = RedisContextStore(redis_url="redis://test")
-    fake.values[store._k("old")] = pickle.dumps("old")
+    fake.values[store._k("old")] = store._codec.dumps("old")
 
     store.apply_patch(
         {"new": {"value": 3}},
@@ -102,7 +144,7 @@ def test_redis_context_patch_pre_serializes_before_transaction(monkeypatch) -> N
     assert len(fake.pipeline_requests) == 1
     assert fake.pipeline_requests[0].transaction is True
     assert store._k("old") not in fake.values
-    assert pickle.loads(fake.values[store._k("new")]) == {"value": 3}
+    assert store._codec.loads(fake.values[store._k("new")]) == {"value": 3}
 
 
 def test_redis_context_patch_rejects_unserializable_values_before_mutation(
@@ -116,7 +158,7 @@ def test_redis_context_patch_rejects_unserializable_values_before_mutation(
     )
     store = RedisContextStore(redis_url="redis://test")
     old_key = store._k("old")
-    fake.values[old_key] = pickle.dumps("old")
+    fake.values[old_key] = store._codec.dumps("old")
 
     with pytest.raises(ValueError, match="failed to serialize"):
         store.apply_patch(
@@ -125,4 +167,86 @@ def test_redis_context_patch_rejects_unserializable_values_before_mutation(
         )
 
     assert fake.pipeline_requests == []
-    assert pickle.loads(fake.values[old_key]) == "old"
+    assert store._codec.loads(fake.values[old_key]) == "old"
+
+
+def test_redis_context_snapshot_removes_the_complete_colon_delimited_prefix(
+    monkeypatch,
+) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(from_url=lambda _url: fake),
+    )
+    store = RedisContextStore(
+        redis_url="redis://test",
+        key_prefix="blackbase:context:run-1",
+    )
+    fake.values[store._k("project.signal")] = store._codec.dumps({"ready": True})
+
+    assert store.snapshot() == {"project.signal": {"ready": True}}
+
+
+def test_redis_context_safe_codec_preserves_formal_lightweight_types(monkeypatch) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(from_url=lambda _url: fake),
+    )
+    store = RedisContextStore(redis_url="redis://test")
+    value = {
+        ("stage", 1): (
+            b"payload",
+            {"ready", "committed"},
+            np.asarray([1.5, 2.5], dtype=np.float32),
+            DataRef(uri="artifact://model", metadata={"fold": 2}),
+            StateRef(provider_id="provider", state_id="state-1"),
+        )
+    }
+
+    store.apply_patch({"runtime": value})
+    restored = store.snapshot()["runtime"]
+
+    assert tuple(restored) == (("stage", 1),)
+    payload = restored[("stage", 1)]
+    assert isinstance(payload, tuple)
+    assert payload[0] == b"payload"
+    assert payload[1] == {"ready", "committed"}
+    assert np.array_equal(payload[2], np.asarray([1.5, 2.5], dtype=np.float32))
+    assert isinstance(payload[3], DataRef) and payload[3].metadata["fold"] == 2
+    assert isinstance(payload[4], StateRef) and payload[4].state_id == "state-1"
+
+
+def test_redis_context_safe_codec_never_falls_back_to_legacy_pickle(monkeypatch) -> None:
+    global _PICKLE_EXECUTED
+    _PICKLE_EXECUTED = False
+    fake = _FakeRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(from_url=lambda _url: fake),
+    )
+    store = RedisContextStore(redis_url="redis://test")
+    fake.values[store._k("attacker")] = pickle.dumps(_MaliciousPickle())
+
+    with pytest.raises(RedisValueCodecError, match="failed to decode"):
+        store.get("attacker")
+
+    assert _PICKLE_EXECUTED is False
+
+
+def test_redis_context_payload_limit_is_enforced_before_mutation(monkeypatch) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(from_url=lambda _url: fake),
+    )
+    store = RedisContextStore(redis_url="redis://test", max_payload_bytes=128)
+
+    with pytest.raises(ValueError, match="failed to serialize"):
+        store.apply_patch({"oversized": "x" * 512})
+
+    assert fake.pipeline_requests == []

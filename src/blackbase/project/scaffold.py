@@ -593,8 +593,15 @@ L0 = {{
     "lease_path": ".blackbase/l0_leases.sqlite",
     # Multi-host: use lease_backend="redis" and set lease_redis_url_env.
     # Redis credentials are resolved from the worker environment, not ResourceContext.
+    # Project execution requires TTL >= 1s and heartbeat <= TTL / 3.
     "lease_ttl_seconds": 30,
     "lease_heartbeat_seconds": 10,
+    # Cancellation controls are separately leased while a Case owns them.
+    # A crashed owner stops heartbeating and its Redis/SQLite record expires.
+    "control_active_ttl_seconds": 120,
+    "control_heartbeat_seconds": 30,
+    # Zero retires completed controls immediately; use a short positive audit grace if needed.
+    "control_retention_seconds": 0,
     # Optional run-scoped hard limits shared by every Case/process.
     # Example: "budgets": {{"evaluations": 10000}},
     "budgets": {{}},

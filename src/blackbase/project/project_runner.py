@@ -17,8 +17,11 @@ from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from blackbase.resources import (
+    ArtifactBinding,
+    ArtifactAuthority,
     CancellationToken,
     DataRef,
+    FilesystemArtifactPublicationLedger,
     RedisTaskTransport,
     ResourceLease,
     ResourceRequirement,
@@ -30,6 +33,7 @@ from blackbase.resources import (
 from blackbase.wire import thaw_wire_value
 
 from .case_execution import execute_case_payload
+from .dag import DagStagePlan
 from .execution import (
     CaseFailure,
     CaseRunIdentity,
@@ -118,10 +122,28 @@ def execute_project(
     stage_names = tuple(str(stage.get("name", "stage")) for stage in stages)
     if len(stage_names) != len(set(stage_names)):
         raise ProjectConfigurationError("Project group stage names must be unique for recovery")
+    dag_plans: dict[str, DagStagePlan] = {}
     for stage in stages:
         stage_name = str(stage.get("name", "stage"))
         _require_supported_stage_policy(stage, stage_name=stage_name)
         declared_cases = tuple(str(name) for name in (stage.get("cases", ()) or ()))
+        if _stage_is_dag(stage):
+            dag_plans[stage_name] = DagStagePlan.from_stage(stage)
+            stage_mode = str(stage.get("mode", "build") or "build")
+            case_modes = stage.get("case_modes", {})
+            if not isinstance(case_modes, Mapping):
+                raise ProjectConfigurationError(
+                    f"DAG Stage '{stage_name}' field 'case_modes' must be a mapping"
+                )
+            invalid_modes = {
+                case_name: str(case_modes.get(case_name, stage_mode) or "build")
+                for case_name in declared_cases
+                if str(case_modes.get(case_name, stage_mode) or "build") != "build"
+            }
+            if invalid_modes:
+                raise ProjectConfigurationError(
+                    f"DAG Stage '{stage_name}' requires mode='build': {invalid_modes}"
+                )
         if len(declared_cases) != len(set(declared_cases)):
             raise ProjectConfigurationError(
                 f"Stage '{stage_name}' contains duplicate Case names; recovery keys must be unique"
@@ -150,7 +172,7 @@ def execute_project(
     resume_external_tasks: dict[tuple[str, str], dict[str, Any]] = {}
     resume_run_id = ""
     resumed_manifest_path = ""
-    resumed_artifacts: dict[str, DataRef] = {}
+    resumed_bindings: dict[str, ArtifactBinding] = {}
     if resume_from is not None:
         resume_path, resume_manifest = load_resume_manifest(root, resume_from)
         validate_resume_manifest(
@@ -164,10 +186,16 @@ def execute_project(
         resume_external_tasks = resume_manifest.external_tasks()
         resume_run_id = resume_manifest.run_id
         resumed_manifest_path = str(resume_path)
-        resumed_artifacts = dict(resume_manifest.artifact_registry)
+        resumed_bindings = _validated_resume_artifacts(
+            resume_manifest,
+            runtime.artifact_authority,
+        )
     exit_code = 0
     case_results: list[CaseRunResult] = []
-    artifact_registry: dict[str, DataRef] = dict(resumed_artifacts)
+    artifact_binding_registry: dict[str, ArtifactBinding] = dict(resumed_bindings)
+    artifact_registry: dict[str, DataRef] = {
+        name: binding.ref for name, binding in artifact_binding_registry.items()
+    }
     case_order = tuple(
         (str(stage.get("name", "stage")), str(case_name))
         for stage in stages
@@ -199,11 +227,18 @@ def execute_project(
             recorder.record_case(result)
 
     def finish(current_exit_code: int) -> ProjectRunResult:
+        try:
+            runtime.close()
+        except BaseException:
+            if recorder is not None:
+                recorder.finish(status="failed", exit_code=1)
+            raise
         result = _project_result(
             project_name,
             group,
             case_results,
             artifact_registry,
+            artifact_binding_registry,
             current_exit_code,
             check=check,
             run_id="" if recorder is None else recorder.run_id,
@@ -216,6 +251,7 @@ def execute_project(
 
     for stage in stages:
         stage_name = str(stage.get("name", "stage"))
+        dag_plan = dag_plans.get(stage_name)
         case_names = tuple(str(name) for name in (stage.get("cases", ()) or ()))
         stage_cli_args = dict(stage.get("case_args", {}) or {})
         stage_modes = dict(stage.get("case_modes", {}) or {})
@@ -223,6 +259,48 @@ def execute_project(
         if _stage_is_external(stage):
             config = _external_stage_config(stage, project_root=root)
             external_audit = _external_transport_audit(config)
+        if dag_plan is not None and not check:
+            resumed_by_name = {
+                case_name: resume_successes[(stage_name, case_name)]
+                for case_name in case_names
+                if (stage_name, case_name) in resume_successes
+            }
+            pending_names = tuple(name for name in case_names if name not in resumed_by_name)
+            dag_results, dag_artifacts, dag_exit_code = _execute_dag_stage(
+                project_root=root,
+                project_name=project_name,
+                stage=stage,
+                plan=dag_plan,
+                case_names=pending_names,
+                resumed_case_names=tuple(resumed_by_name),
+                runtime=runtime,
+                artifact_registry=artifact_registry,
+                artifact_binding_registry=artifact_binding_registry,
+                case_args=case_args,
+                framework=framework,
+                extra_python_paths=extra_python_paths,
+                on_case_result=None if recorder is None else recorder.record_case,
+                execution_run_id=execution_run_id,
+            )
+            pending_by_name = {item.request.case_name: item for item in dag_results}
+            for case_name in case_names:
+                if case_name in resumed_by_name:
+                    retain(resumed_by_name[case_name])
+                else:
+                    retain(pending_by_name[case_name])
+            for case_name, refs, publications in dag_artifacts:
+                _register_case_artifacts(
+                    artifact_registry,
+                    artifact_binding_registry,
+                    stage_name=stage_name,
+                    case_name=case_name,
+                    artifact_refs=refs,
+                    artifact_publications=publications,
+                )
+            exit_code = exit_code or dag_exit_code
+            if dag_exit_code and _stage_fail_fast(stage):
+                return finish(exit_code)
+            continue
         if (_stage_is_parallel(stage) or _stage_is_external(stage)) and not check:
             resumed_by_name = {
                 case_name: resume_successes[(stage_name, case_name)]
@@ -237,6 +315,7 @@ def execute_project(
                 case_names=pending_names,
                 runtime=runtime,
                 artifact_registry=artifact_registry,
+                artifact_binding_registry=artifact_binding_registry,
                 case_args=case_args,
                 framework=framework,
                 extra_python_paths=extra_python_paths,
@@ -255,12 +334,14 @@ def execute_project(
                     retain(resumed_by_name[case_name])
                 else:
                     retain(pending_by_name[case_name])
-            for case_name, refs in parallel_artifacts:
+            for case_name, refs, publications in parallel_artifacts:
                 _register_case_artifacts(
                     artifact_registry,
+                    artifact_binding_registry,
                     stage_name=stage_name,
                     case_name=case_name,
                     artifact_refs=refs,
+                    artifact_publications=publications,
                 )
             exit_code = exit_code or parallel_exit_code
             if parallel_exit_code and _stage_fail_fast(stage):
@@ -279,15 +360,26 @@ def execute_project(
             argv = tuple(stage_cli_args.get(case_name, ())) + case_args
             component_overrides = _case_mapping(stage, "component_overrides", case_name)
             input_artifacts: dict[str, DataRef] = {}
+            input_artifact_bindings: dict[str, ArtifactBinding] = {}
             effective_request: CaseRunRequest | None = None
             identity = _case_identity(execution_run_id, stage_name, case_name)
             control = _case_control(runtime, stage, case_name)
             try:
-                input_artifacts = _resolve_case_input_artifacts(
+                declared_input_artifacts = _case_mapping(
+                    stage,
+                    "input_artifacts",
+                    case_name,
+                )
+                input_artifact_bindings = _resolve_case_input_artifacts(
                     stage,
                     case_name=case_name,
-                    artifact_registry=artifact_registry,
+                    artifact_registry=artifact_binding_registry,
+                    allow_unpublished=bool(check),
                 )
+                input_artifacts = {
+                    name: binding.ref
+                    for name, binding in input_artifact_bindings.items()
+                }
                 if mode == "cli" and (component_overrides or input_artifacts):
                     raise ProjectConfigurationError(
                         f"CLI-mode Case '{case_name}' cannot receive in-process component_overrides "
@@ -301,7 +393,10 @@ def execute_project(
                     extra_import_paths=extra_python_paths,
                 )
                 lease = runtime.acquire_case(case_name, request=request, stage_name=stage_name)
-                lease_guard = runtime.start_lease_guard(lease)
+                lease_guard = runtime.start_lease_guard(
+                    lease,
+                    cancellation_ref=control.cancellation,
+                )
                 resource_context = runtime.resource_context(
                     lease,
                     case_name=case_name,
@@ -324,8 +419,22 @@ def execute_project(
                     resource_context=_as_dict(resource_context),
                     component_overrides=component_overrides,
                     input_artifacts=input_artifacts,
+                    input_artifact_bindings=input_artifact_bindings,
                     argv=argv,
-                    metadata={"check_only": bool(check)},
+                    metadata={
+                        "check_only": bool(check),
+                        **(
+                            {"dag": dag_plan.request_metadata(case_name)}
+                            if dag_plan is not None
+                            else {}
+                        ),
+                        "declared_input_artifacts": declared_input_artifacts,
+                        "unresolved_check_input_artifacts": {
+                            str(name): str(registry_key)
+                            for name, registry_key in declared_input_artifacts.items()
+                            if str(name) not in input_artifact_bindings
+                        },
+                    },
                 )
                 if mode == "cli":
                     if check and "--check" not in argv:
@@ -448,6 +557,10 @@ def execute_project(
                     root,
                     extra_python_paths=extra_python_paths,
                 ).execute(effective_request)
+                result = _validate_case_artifact_publications(
+                    result,
+                    runtime.artifact_authority,
+                )
                 lease_guard.assert_current()
                 runtime_state = dict(result.metadata.get("runtime_state", {}) or {})
                 _print_project_check(
@@ -462,9 +575,11 @@ def execute_project(
                 )
                 _register_case_artifacts(
                     artifact_registry,
+                    artifact_binding_registry,
                     stage_name=stage_name,
                     case_name=case_name,
                     artifact_refs=result.artifact_refs,
+                    artifact_publications=result.artifact_publications,
                 )
                 retain(result)
                 if not result.ok:
@@ -494,6 +609,7 @@ def execute_project(
                         control=control,
                         component_overrides=component_overrides,
                         input_artifacts=input_artifacts,
+                        input_artifact_bindings=input_artifact_bindings,
                         argv=argv,
                     )
                 error = f"{type(exc).__name__}: {exc}"
@@ -532,6 +648,7 @@ def _project_result(
     group: str,
     case_results: Sequence[CaseRunResult],
     artifact_registry: Mapping[str, DataRef],
+    artifact_bindings: Mapping[str, ArtifactBinding],
     exit_code: int,
     *,
     check: bool,
@@ -545,6 +662,7 @@ def _project_result(
         group=group,
         case_results=tuple(case_results),
         artifact_registry=dict(artifact_registry),
+        artifact_bindings=dict(artifact_bindings),
         status=status,
         exit_code=int(exit_code),
         run_id=run_id,
@@ -563,11 +681,13 @@ def _require_supported_stage_policy(stage: Mapping[str, Any], *, stage_name: str
         "run_all_in_parallel",
         "external",
         "external_workers",
+        "dag",
+        "dependency_graph",
     }:
         return
     raise ProjectConfigurationError(
         f"Stage '{stage_name}' declares unsupported execution policy '{policy}'. "
-        "Supported policies are serial, parallel, and external."
+        "Supported policies are serial, parallel, external, and dag."
     )
 
 
@@ -576,9 +696,238 @@ def _stage_is_parallel(stage: Mapping[str, Any]) -> bool:
     return policy in {"parallel", "run_all_in_parallel"}
 
 
+def _stage_is_dag(stage: Mapping[str, Any]) -> bool:
+    policy = str(stage.get("policy", "serial") or "serial").strip().lower()
+    return policy in {"dag", "dependency_graph"}
+
+
 def _stage_is_external(stage: Mapping[str, Any]) -> bool:
     policy = str(stage.get("policy", "serial") or "serial").strip().lower()
     return policy in {"external", "external_workers"}
+
+
+def _execute_dag_stage(
+    *,
+    project_root: Path,
+    project_name: str,
+    stage: Mapping[str, Any],
+    plan: DagStagePlan,
+    case_names: Sequence[str],
+    resumed_case_names: Sequence[str],
+    runtime: ProjectL0Runtime,
+    artifact_registry: Mapping[str, DataRef],
+    artifact_binding_registry: Mapping[str, ArtifactBinding],
+    case_args: Sequence[str],
+    framework: str,
+    extra_python_paths: Sequence[Path | str],
+    on_case_result: Callable[[CaseRunResult], None] | None = None,
+    execution_run_id: str = "",
+) -> tuple[
+    list[CaseRunResult],
+    list[tuple[str, dict[str, DataRef], dict[str, Any]]],
+    int,
+]:
+    """Run a validated DAG in dependency-ready process-isolated waves.
+
+    Every wave contains only nodes whose dependencies have succeeded.  L0 and
+    the existing parallel Stage executor remain the authority for actual
+    fanout, leases, cancellation and worker isolation.
+    """
+
+    pending = set(str(name) for name in case_names)
+    succeeded = set(str(name) for name in resumed_case_names)
+    failed: set[str] = set()
+    results: dict[str, CaseRunResult] = {}
+    artifacts: list[tuple[str, dict[str, DataRef], dict[str, Any]]] = []
+    working_artifacts = dict(artifact_registry)
+    working_bindings = dict(artifact_binding_registry)
+    exit_code = 0
+
+    def retain(result: CaseRunResult) -> None:
+        name = result.request.case_name
+        results[name] = result
+        if on_case_result is not None:
+            on_case_result(result)
+
+    while pending:
+        while True:
+            blocked = [
+                name
+                for name in plan.topological_order
+                if name in pending
+                and any(
+                    dependency in failed
+                    for dependency in plan.dependencies_for(name)
+                )
+            ]
+            if not blocked:
+                break
+            for case_name in blocked:
+                dependencies = tuple(
+                    dependency
+                    for dependency in plan.dependencies_for(case_name)
+                    if dependency in failed
+                )
+                retain(
+                    _dag_skipped_result(
+                        project_root=project_root,
+                        project_name=project_name,
+                        stage=stage,
+                        plan=plan,
+                        case_name=case_name,
+                        execution_run_id=execution_run_id,
+                        kind="DependencyFailed",
+                        message=(
+                            f"DAG Case '{case_name}' was blocked by failed dependencies: "
+                            f"{list(dependencies)}"
+                        ),
+                        dependencies=dependencies,
+                    )
+                )
+                pending.remove(case_name)
+                failed.add(case_name)
+                exit_code = 1
+
+        if not pending:
+            break
+        if failed and _stage_fail_fast(stage):
+            for case_name in plan.topological_order:
+                if case_name not in pending:
+                    continue
+                retain(
+                    _dag_skipped_result(
+                        project_root=project_root,
+                        project_name=project_name,
+                        stage=stage,
+                        plan=plan,
+                        case_name=case_name,
+                        execution_run_id=execution_run_id,
+                        kind="DagFailFastSkip",
+                        message="DAG Stage stopped after an upstream Case failure",
+                        dependencies=plan.dependencies_for(case_name),
+                    )
+                )
+                failed.add(case_name)
+            pending.clear()
+            exit_code = 1
+            break
+
+        ready = tuple(
+            name
+            for name in plan.topological_order
+            if name in pending
+            and all(
+                dependency in succeeded
+                for dependency in plan.dependencies_for(name)
+            )
+        )
+        if not ready:
+            unresolved = {
+                name: [
+                    dependency
+                    for dependency in plan.dependencies_for(name)
+                    if dependency not in succeeded
+                ]
+                for name in plan.topological_order
+                if name in pending
+            }
+            raise ProjectConfigurationError(
+                f"DAG Stage '{plan.stage_name}' cannot make progress: {unresolved}"
+            )
+
+        wave_stage = dict(stage)
+        wave_stage["cases"] = list(ready)
+        wave_results, wave_artifacts, wave_exit_code = _execute_parallel_stage(
+            project_root=project_root,
+            project_name=project_name,
+            stage=wave_stage,
+            case_names=ready,
+            runtime=runtime,
+            artifact_registry=working_artifacts,
+            artifact_binding_registry=working_bindings,
+            case_args=case_args,
+            framework=framework,
+            extra_python_paths=extra_python_paths,
+            on_case_result=None,
+            execution_backend="process",
+            execution_run_id=execution_run_id,
+            request_metadata={
+                name: {"dag": plan.request_metadata(name)} for name in ready
+            },
+        )
+        wave_by_name = {item.request.case_name: item for item in wave_results}
+        for case_name in ready:
+            result = wave_by_name[case_name]
+            retain(result)
+            pending.remove(case_name)
+            if result.ok:
+                succeeded.add(case_name)
+            else:
+                failed.add(case_name)
+                exit_code = exit_code or result.exit_code or 1
+        for case_name, refs, publications in wave_artifacts:
+            artifacts.append((case_name, refs, publications))
+            _register_case_artifacts(
+                working_artifacts,
+                working_bindings,
+                stage_name=plan.stage_name,
+                case_name=case_name,
+                artifact_refs=refs,
+                artifact_publications=publications,
+            )
+        exit_code = exit_code or wave_exit_code
+
+    return (
+        [results[name] for name in plan.cases if name in results],
+        artifacts,
+        int(exit_code),
+    )
+
+
+def _dag_skipped_result(
+    *,
+    project_root: Path,
+    project_name: str,
+    stage: Mapping[str, Any],
+    plan: DagStagePlan,
+    case_name: str,
+    execution_run_id: str,
+    kind: str,
+    message: str,
+    dependencies: Sequence[str],
+) -> CaseRunResult:
+    stage_name = plan.stage_name
+    case_kind = load_case_kind(project_root, case_name, stage=stage, default="solver")
+    stage_modes = dict(stage.get("case_modes", {}) or {})
+    mode = str(stage_modes.get(case_name, stage.get("mode", "build")) or "build")
+    request = CaseRunRequest(
+        project_name=project_name,
+        stage_name=stage_name,
+        case_name=case_name,
+        case_kind=case_kind,
+        mode=mode,
+        identity=_case_identity(execution_run_id, stage_name, case_name),
+        component_overrides=_case_mapping(stage, "component_overrides", case_name),
+        metadata={
+            "dag": plan.request_metadata(case_name),
+            "declared_input_artifacts": _case_mapping(
+                stage,
+                "input_artifacts",
+                case_name,
+            ),
+        },
+    )
+    return CaseRunResult(
+        request=request,
+        status="skipped",
+        exit_code=1,
+        failure=CaseFailure(
+            kind=kind,
+            message=message,
+            phase="dag_schedule",
+            details={"dependencies": list(dependencies)},
+        ),
+    )
 
 
 def _execute_parallel_stage(
@@ -589,6 +938,7 @@ def _execute_parallel_stage(
     case_names: Sequence[str],
     runtime: ProjectL0Runtime,
     artifact_registry: Mapping[str, DataRef],
+    artifact_binding_registry: Mapping[str, ArtifactBinding],
     case_args: Sequence[str],
     framework: str,
     extra_python_paths: Sequence[Path | str],
@@ -598,7 +948,12 @@ def _execute_parallel_stage(
     execution_run_id: str = "",
     resume_run_id: str = "",
     resume_external_tasks: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
-) -> tuple[list[CaseRunResult], list[tuple[str, dict[str, DataRef]]], int]:
+    request_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[
+    list[CaseRunResult],
+    list[tuple[str, dict[str, DataRef], dict[str, Any]]],
+    int,
+]:
     """Execute independent Cases in isolated worker processes under Project L0."""
 
     stage_name = str(stage.get("name", "stage"))
@@ -614,11 +969,18 @@ def _execute_parallel_stage(
     )
     prepared: deque[dict[str, Any]] = deque()
     results_by_index: dict[int, CaseRunResult] = {}
-    artifacts_by_index: dict[int, tuple[str, dict[str, DataRef]]] = {}
+    artifacts_by_index: dict[
+        int,
+        tuple[str, dict[str, DataRef], dict[str, Any]],
+    ] = {}
     exit_code = 0
     external_transport: TaskTransport | None = None
     external_config: dict[str, Any] = {}
     resumable_external = dict(resume_external_tasks or {})
+    metadata_by_case = {
+        str(name): dict(value)
+        for name, value in dict(request_metadata or {}).items()
+    }
     if execution_backend == "external":
         external_config = _external_stage_config(stage, project_root=project_root)
         external_transport = _build_external_transport(external_config)
@@ -635,6 +997,7 @@ def _execute_parallel_stage(
         argv = tuple(stage_cli_args.get(case_name, ())) + tuple(case_args)
         component_overrides = _case_mapping(stage, "component_overrides", case_name)
         input_artifacts: dict[str, DataRef] = {}
+        input_artifact_bindings: dict[str, ArtifactBinding] = {}
         identity = _case_identity(execution_run_id, stage_name, case_name)
         control = _case_control(runtime, stage, case_name)
         if preparation_stopped:
@@ -649,6 +1012,7 @@ def _execute_parallel_stage(
                     control=control,
                     component_overrides=component_overrides,
                     argv=argv,
+                    metadata=metadata_by_case.get(case_name, {}),
                 ),
                 status="skipped",
                 exit_code=1,
@@ -666,11 +1030,15 @@ def _execute_parallel_stage(
                     f"Parallel stage '{stage_name}' requires mode='build' for Case '{case_name}'; "
                     "CLI fanout needs an explicit external worker backend."
                 )
-            input_artifacts = _resolve_case_input_artifacts(
+            input_artifact_bindings = _resolve_case_input_artifacts(
                 stage,
                 case_name=case_name,
-                artifact_registry=artifact_registry,
+                artifact_registry=artifact_binding_registry,
             )
+            input_artifacts = {
+                name: binding.ref
+                for name, binding in input_artifact_bindings.items()
+            }
             request = load_case_resource_request(
                 case_name,
                 project_root=project_root,
@@ -687,9 +1055,11 @@ def _execute_parallel_stage(
                     "argv": argv,
                     "component_overrides": component_overrides,
                     "input_artifacts": input_artifacts,
+                    "input_artifact_bindings": input_artifact_bindings,
                     "resource_request": request,
                     "identity": identity,
                     "control": control,
+                    "metadata": metadata_by_case.get(case_name, {}),
                 }
             )
         except Exception as exc:
@@ -704,7 +1074,9 @@ def _execute_parallel_stage(
                 control=control,
                 component_overrides=component_overrides,
                 input_artifacts=input_artifacts,
+                input_artifact_bindings=input_artifact_bindings,
                 argv=argv,
+                metadata=metadata_by_case.get(case_name, {}),
             )
             retain_parallel_result(index, _failed_case_result(request_contract, exc))
             _print_parallel_error(project_name, stage_name, case_name, exc)
@@ -798,7 +1170,10 @@ def _execute_parallel_stage(
                         candidate_lease = ResourceLease.from_dict(lease_payload)
                         if runtime.allocator.is_current(candidate_lease):
                             lease = candidate_lease
-                            lease_guard = runtime.start_lease_guard(lease)
+                            lease_guard = runtime.start_lease_guard(
+                                lease,
+                                cancellation_ref=item["control"].cancellation,
+                            )
                 elif not bool(item.get("external_reconciled")):
                     try:
                         lease = runtime.acquire_case(
@@ -829,7 +1204,10 @@ def _execute_parallel_stage(
                         if _stage_fail_fast(stage):
                             stop_launching = True
                         continue
-                    lease_guard = runtime.start_lease_guard(lease)
+                    lease_guard = runtime.start_lease_guard(
+                        lease,
+                        cancellation_ref=item["control"].cancellation,
+                    )
 
                 prepared.popleft()
                 raw_resource_context = (
@@ -993,6 +1371,10 @@ def _execute_parallel_stage(
                     else:
                         worker_result = dict(future_value)
                     case_result = CaseRunResult.from_dict(worker_result)
+                    case_result = _validate_case_artifact_publications(
+                        case_result,
+                        runtime.artifact_authority,
+                    )
                     if bool(item.get("external_reconciled")) and case_result.ok:
                         case_result = replace(case_result, status="resumed")
                     refs = dict(case_result.artifact_refs)
@@ -1022,7 +1404,11 @@ def _execute_parallel_stage(
                             ),
                         )
                     retain_parallel_result(int(item["index"]), case_result)
-                    artifacts_by_index[int(item["index"])] = (str(item["case_name"]), refs)
+                    artifacts_by_index[int(item["index"])] = (
+                        str(item["case_name"]),
+                        refs,
+                        dict(case_result.artifact_publications),
+                    )
                     if not case_result.ok:
                         exit_code = 1
                         if _stage_fail_fast(stage):
@@ -1419,7 +1805,9 @@ def _parallel_case_request(
         resource_context=_as_dict(resource_context),
         component_overrides=dict(item["component_overrides"]),
         input_artifacts=dict(item["input_artifacts"]),
+        input_artifact_bindings=dict(item["input_artifact_bindings"]),
         argv=tuple(item["argv"]),
+        metadata=dict(item.get("metadata", {}) or {}),
     )
 
 
@@ -1474,15 +1862,19 @@ def _resolve_case_input_artifacts(
     stage: Mapping[str, Any],
     *,
     case_name: str,
-    artifact_registry: Mapping[str, DataRef],
-) -> dict[str, DataRef]:
+    artifact_registry: Mapping[str, ArtifactBinding],
+    allow_unpublished: bool = False,
+) -> dict[str, ArtifactBinding]:
     declared = _case_mapping(stage, "input_artifacts", case_name)
-    resolved: dict[str, DataRef] = {}
+    resolved: dict[str, ArtifactBinding] = {}
     for input_name, registry_key in declared.items():
         key = str(registry_key)
         if key not in artifact_registry:
+            if allow_unpublished:
+                continue
             raise ProjectConfigurationError(
-                f"Case '{case_name}' requires missing artifact ref '{key}' for input '{input_name}'"
+                f"Case '{case_name}' requires missing authoritative ArtifactBinding "
+                f"'{key}' for input '{input_name}'"
             )
         resolved[str(input_name)] = artifact_registry[key]
     return resolved
@@ -1551,17 +1943,83 @@ def _coerce_data_ref(value: Any) -> DataRef | None:
 
 def _register_case_artifacts(
     registry: dict[str, DataRef],
+    binding_registry: dict[str, ArtifactBinding],
     *,
     stage_name: str,
     case_name: str,
     artifact_refs: Mapping[str, DataRef],
+    artifact_publications: Mapping[str, Any],
 ) -> None:
     for artifact_name, ref in artifact_refs.items():
+        publication = artifact_publications.get(artifact_name)
+        if publication is None:
+            raise ProjectConfigurationError(
+                f"Case artifact '{artifact_name}' has no publication receipt"
+            )
+        binding = ArtifactBinding(ref=ref, publication=publication)
         qualified = f"{stage_name}.{case_name}.{artifact_name}"
         case_qualified = f"{case_name}.{artifact_name}"
         registry[qualified] = ref
         registry[case_qualified] = ref
         registry.setdefault(str(artifact_name), ref)
+        binding_registry[qualified] = binding
+        binding_registry[case_qualified] = binding
+        binding_registry.setdefault(str(artifact_name), binding)
+
+
+def _validate_case_artifact_publications(
+    result: CaseRunResult,
+    authority_payload: Mapping[str, Any],
+) -> CaseRunResult:
+    """Fail closed unless every formal ref has a durable authority receipt."""
+
+    if not result.ok or not result.artifact_refs:
+        return result
+    authority = ArtifactAuthority.from_dict(authority_payload)
+    for name, ref in result.artifact_refs.items():
+        receipt = result.artifact_publications.get(name)
+        ledger = (
+            None
+            if receipt is None
+            else FilesystemArtifactPublicationLedger(
+                authority,
+                project_run_id=receipt.project_run_id,
+                case_run_id=receipt.case_run_id,
+            )
+        )
+        if receipt is None or receipt.ref != ref or not ledger.verify(receipt):
+            raise ProjectConfigurationError(
+                f"Case artifact '{name}' has no valid finalized publication receipt"
+            )
+    return result
+
+
+def _validated_resume_artifacts(
+    manifest: ProjectRunManifest,
+    authority_payload: Mapping[str, Any],
+) -> dict[str, ArtifactBinding]:
+    """Rebuild the resumed Registry only from verified successful receipts."""
+
+    authority = ArtifactAuthority.from_dict(authority_payload)
+    rebuilt_refs: dict[str, DataRef] = {}
+    rebuilt_bindings: dict[str, ArtifactBinding] = {}
+    for (stage_name, case_name), result in manifest.successful_cases().items():
+        checked = _validate_case_artifact_publications(result, authority_payload)
+        _register_case_artifacts(
+            rebuilt_refs,
+            rebuilt_bindings,
+            stage_name=stage_name,
+            case_name=case_name,
+            artifact_refs=checked.artifact_refs,
+            artifact_publications=checked.artifact_publications,
+        )
+    declared = dict(manifest.artifact_registry)
+    if declared != rebuilt_refs:
+        raise ProjectConfigurationError(
+            "Project run manifest Artifact Registry does not match its verified "
+            "successful Case publication receipts"
+        )
+    return rebuilt_bindings
 
 
 def build_parser() -> argparse.ArgumentParser:

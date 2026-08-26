@@ -226,6 +226,18 @@ class SQLiteBudgetAuthority:
             reclaimed=reclaimed,
         )
 
+    def reservation(self, reservation: BudgetReservation | str) -> BudgetReservation | None:
+        """Return the durable reservation state after applying lease reclamation."""
+
+        identifier = _reservation_id(reservation)
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._reclaim_stale_locked(connection, now=now)
+            row = self._reservation_row_locked(connection, identifier)
+            connection.commit()
+        return None if row is None else _reservation_from_row(row)
+
     def reserve(
         self,
         budget: str,
@@ -612,6 +624,14 @@ class RedisBudgetAuthority:
             reserved=reserved,
             reclaimed=reclaimed,
         )
+
+    def reservation(self, reservation: BudgetReservation | str) -> BudgetReservation | None:
+        """Return the durable reservation state after applying lease reclamation."""
+
+        identifier = _reservation_id(reservation)
+        with self._locked():
+            self._reclaim_stale_locked(now=self._now())
+            return self._load_reservation_locked(identifier)
 
     def reserve(
         self,

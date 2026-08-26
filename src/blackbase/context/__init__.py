@@ -57,6 +57,7 @@ from .context_store import (
     create_context_store,
 )
 from .context_events import (
+    CONTEXT_EVENT_KINDS,
     ContextEvent,
     apply_context_event,
     record_context_event,
@@ -74,10 +75,17 @@ from .snapshot_store import (
     RedisSnapshotStore,
     create_snapshot_store,
     make_snapshot_key,
+    snapshot_content_digest,
     unwrap_snapshot_payload,
     wrap_snapshot_payload,
 )
 from .value_isolation import detach_context_value
+from .redis_codec import (
+    REDIS_VALUE_ENVELOPE,
+    SUPPORTED_REDIS_SERIALIZERS,
+    RedisValueCodec,
+    RedisValueCodecError,
+)
 from .storage_config import StateStoreConfig
 from .runtime_projection import (
     RUNTIME_PROJECTION_AUDIT_MAX_BYTES,
@@ -149,6 +157,7 @@ __all__ = [
     "create_context_store",
     
     # context_events
+    "CONTEXT_EVENT_KINDS",
     "ContextEvent",
     "apply_context_event",
     "record_context_event",
@@ -166,10 +175,15 @@ __all__ = [
     "RedisSnapshotStore",
     "create_snapshot_store",
     "make_snapshot_key",
+    "snapshot_content_digest",
     "unwrap_snapshot_payload",
     "wrap_snapshot_payload",
     # value isolation
     "detach_context_value",
+    "REDIS_VALUE_ENVELOPE",
+    "SUPPORTED_REDIS_SERIALIZERS",
+    "RedisValueCodec",
+    "RedisValueCodecError",
     "StateStoreConfig",
     # runtime projection
     "RUNTIME_PROJECTION_SCHEMA",

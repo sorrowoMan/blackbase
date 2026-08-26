@@ -7,12 +7,13 @@ backend to be switched (in-memory by default, Redis optionally).
 
 from __future__ import annotations
 
-import pickle
 import threading
-import warnings
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, Mapping, Optional
+
+from .redis_codec import RedisValueCodec, RedisValueCodecError
+from .value_isolation import detach_context_value
 
 
 class _ContextStoreABC(ABC):
@@ -234,7 +235,7 @@ class ContextStore(InMemoryContextStore):
 
 
 class RedisContextStore(_ContextStoreABC):
-    """Redis-backed context store (optional dependency)."""
+    """Redis-backed context store with a versioned, fail-closed value codec."""
 
     supports_atomic_patch = True
     
@@ -244,6 +245,10 @@ class RedisContextStore(_ContextStoreABC):
         redis_url: str = "redis://localhost:6379/0",
         key_prefix: str = "blackbase:context",
         default_ttl_seconds: Optional[float] = None,
+        serializer: str = "safe",
+        hmac_env_var: str = "BLACKBASE_CONTEXT_HMAC_KEY",
+        unsafe_allow_legacy_pickle: bool = False,
+        max_payload_bytes: int = 262_144,
     ) -> None:
         try:
             import redis  # type: ignore
@@ -252,6 +257,22 @@ class RedisContextStore(_ContextStoreABC):
         self._redis = redis.from_url(redis_url)
         self._key_prefix = str(key_prefix).rstrip(":")
         self.default_ttl_seconds = default_ttl_seconds
+        self.serializer = str(serializer or "safe").strip().lower()
+        self.hmac_env_var = str(hmac_env_var or "BLACKBASE_CONTEXT_HMAC_KEY").strip()
+        self.unsafe_allow_legacy_pickle = bool(unsafe_allow_legacy_pickle)
+        self.max_payload_bytes = int(max_payload_bytes)
+        if self.serializer == "safe" and self.unsafe_allow_legacy_pickle:
+            raise ValueError(
+                "serializer='safe' cannot enable unsafe_allow_legacy_pickle; "
+                "use an explicit pickle_unsafe migration store"
+            )
+        self._codec = RedisValueCodec(
+            serializer=self.serializer,
+            hmac_env_var=self.hmac_env_var,
+            unsafe_allow_legacy_pickle=self.unsafe_allow_legacy_pickle,
+            max_payload_bytes=self.max_payload_bytes,
+            envelope_scope="context",
+        )
     
     def _k(self, key: str) -> str:
         """Get prefixed key."""
@@ -272,20 +293,19 @@ class RedisContextStore(_ContextStoreABC):
         if raw is None:
             return default
         try:
-            return pickle.loads(raw)
-        except Exception:
-            return default
+            return self._codec.loads(raw)
+        except RedisValueCodecError as exc:
+            raise RedisValueCodecError(
+                f"failed to decode Redis context key {str(key)!r}"
+            ) from exc
     
     def set(self, key: str, value: Any, *, ttl_seconds: Optional[float] = None) -> None:
         try:
-            payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            payload = self._serialize_context_value(value, key=str(key))
         except Exception as exc:
-            warnings.warn(
-                f"RedisContextStore failed to pickle value for key '{key}': {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
+            raise ValueError(
+                f"RedisContextStore failed to serialize value for key {str(key)!r}"
+            ) from exc
         ttl = self._effective_ttl(ttl_seconds)
         redis_key = self._k(key)
         if ttl is None:
@@ -308,7 +328,7 @@ class RedisContextStore(_ContextStoreABC):
         serialized: Dict[str, bytes] = {}
         for key, value in normalized_values.items():
             try:
-                serialized[key] = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+                serialized[key] = self._serialize_context_value(value, key=key)
             except Exception as exc:
                 raise ValueError(
                     f"RedisContextStore failed to serialize value for key {key!r}"
@@ -325,6 +345,13 @@ class RedisContextStore(_ContextStoreABC):
             else:
                 pipeline.setex(redis_key, ttl, payload)
         pipeline.execute()
+
+    def _serialize_context_value(self, value: Any, *, key: str) -> bytes:
+        detached = detach_context_value(
+            value,
+            path=f"redis_context[{key!r}]",
+        )
+        return self._codec.dumps(detached)
     
     def clear(self) -> None:
         pattern = f"{self._key_prefix}:*"
@@ -339,17 +366,22 @@ class RedisContextStore(_ContextStoreABC):
     
     def snapshot(self) -> Dict[str, Any]:
         pattern = f"{self._key_prefix}:*"
+        prefix = f"{self._key_prefix}:"
         out: Dict[str, Any] = {}
         for raw_key in self._redis.scan_iter(match=pattern, count=200):
             try:
                 key_text = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
-                short_key = key_text.split(":", 1)[1] if ":" in key_text else key_text
+                if not key_text.startswith(prefix):
+                    continue
+                short_key = key_text[len(prefix):]
                 raw = self._redis.get(raw_key)
                 if raw is None:
                     continue
-                out[short_key] = pickle.loads(raw)
-            except Exception:
-                continue
+                out[short_key] = self._codec.loads(raw)
+            except RedisValueCodecError as exc:
+                raise RedisValueCodecError(
+                    f"failed to decode Redis context key {short_key!r}"
+                ) from exc
         return out
 
 
@@ -359,6 +391,10 @@ def create_context_store(
     ttl_seconds: Optional[float] = None,
     redis_url: str = "redis://localhost:6379/0",
     key_prefix: str = "blackbase:context",
+    serializer: str = "safe",
+    hmac_env_var: str = "BLACKBASE_CONTEXT_HMAC_KEY",
+    unsafe_allow_legacy_pickle: bool = False,
+    max_payload_bytes: int = 262_144,
 ) -> _ContextStoreABC:
     """Create a context store instance based on backend type."""
     backend_name = str(backend or "memory").strip().lower()
@@ -369,5 +405,9 @@ def create_context_store(
             redis_url=redis_url,
             key_prefix=key_prefix,
             default_ttl_seconds=ttl_seconds,
+            serializer=serializer,
+            hmac_env_var=hmac_env_var,
+            unsafe_allow_legacy_pickle=unsafe_allow_legacy_pickle,
+            max_payload_bytes=max_payload_bytes,
         )
     raise ValueError(f"Unsupported context store backend: {backend}")

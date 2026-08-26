@@ -8,6 +8,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .value_isolation import detach_context_value
+
+
+CONTEXT_EVENT_KINDS = frozenset({"set", "update", "append", "extend", "delete"})
+
 
 @dataclass(frozen=True)
 class ContextEvent:
@@ -19,11 +24,39 @@ class ContextEvent:
     generation: Optional[int] = None
     step: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        kind = str(self.kind or "").strip().lower()
+        if kind not in CONTEXT_EVENT_KINDS:
+            raise ValueError(
+                f"unsupported context event kind {kind!r}; "
+                f"expected one of {sorted(CONTEXT_EVENT_KINDS)}"
+            )
+        key = None if self.key is None else str(self.key)
+        if kind in {"set", "append", "extend", "delete"} and key is None:
+            raise ValueError(f"context event kind={kind!r} requires a key")
+        value = detach_context_value(
+            self.value,
+            path=f"context_event.{kind}.value",
+        )
+        if kind == "update" and not isinstance(value, Mapping):
+            raise TypeError("context update event value must be a Mapping")
+        if kind == "extend" and (
+            not isinstance(value, Iterable)
+            or isinstance(value, (str, bytes, bytearray, Mapping))
+        ):
+            raise TypeError("context extend event value must be a non-mapping iterable")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "value", value)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kind": self.kind,
             "key": self.key,
-            "value": self.value,
+            "value": detach_context_value(
+                self.value,
+                path=f"context_event.{self.kind}.payload",
+            ),
             "timestamp": float(self.timestamp),
             "source": self.source,
             "generation": self.generation,
@@ -56,28 +89,38 @@ def record_context_event(
 
 
 def apply_context_event(context: Dict[str, Any], event: Mapping[str, Any]) -> None:
-    kind = str(event.get("kind", "set"))
-    key = event.get("key")
-    value = event.get("value")
+    normalized = ContextEvent(
+        kind=str(event.get("kind", "set")),
+        key=event.get("key"),
+        value=event.get("value"),
+        timestamp=float(event.get("timestamp", time.time())),
+        source=event.get("source"),
+        generation=event.get("generation"),
+        step=event.get("step"),
+    )
+    kind = normalized.kind
+    key = normalized.key
+    value = normalized.value
 
     if kind == "set":
-        if key is not None:
-            context[key] = value
+        assert key is not None
+        context[key] = value
         return
     if kind == "update":
         if isinstance(value, Mapping):
             context.update(dict(value))
         return
     if kind == "append":
-        if key is not None:
-            context.setdefault(key, []).append(value)
+        assert key is not None
+        context.setdefault(key, []).append(value)
         return
     if kind == "extend":
-        if key is not None and isinstance(value, Iterable):
-            context.setdefault(key, []).extend(list(value))
+        assert key is not None
+        context.setdefault(key, []).extend(list(value))
         return
     if kind == "delete":
-        if key is not None and key in context:
+        assert key is not None
+        if key in context:
             del context[key]
         return
 
@@ -90,7 +133,13 @@ def replay_context(
     *,
     strict: bool = False,
 ) -> Dict[str, Any]:
-    ctx = dict(base_context)
+    detached = detach_context_value(
+        dict(base_context),
+        path="context_replay.base",
+    )
+    if not isinstance(detached, dict):  # pragma: no cover - Mapping guarantees this
+        raise TypeError("detached context replay base must be a dict")
+    ctx = detached
     for event in events:
         try:
             apply_context_event(ctx, event)
@@ -102,6 +151,7 @@ def replay_context(
 
 
 __all__ = [
+    "CONTEXT_EVENT_KINDS",
     "ContextEvent",
     "record_context_event",
     "apply_context_event",

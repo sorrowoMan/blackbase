@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from blackbase.resources import (
+    CancellationRef,
     ClaimedTask,
     RedisLeaseStore,
     RedisBudgetAuthority,
@@ -26,7 +27,7 @@ from blackbase.resources import (
     SharedBudgetExceeded,
     WorkerDescriptor,
 )
-from blackbase.project import CaseRunRequest
+from blackbase.project import CaseRunRequest, ExecutionControl
 from blackbase.project.external_worker import ExternalCaseWorker
 from blackbase.project.runtime import ProjectL0Runtime, ProjectRuntimeConfig
 from blackbase.project.scaffold import add_case, create_project
@@ -569,6 +570,13 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                 case_name="remote_case",
                 resource_request=ResourceRequest(workers=1, threads=1).as_dict(),
                 resource_context=resource_context,
+                control=ExecutionControl(
+                    cancellation=CancellationRef(
+                        backend="sqlite",
+                        path=str(project_root / ".blackbase" / "controls.sqlite"),
+                        namespace="redis-worker-project",
+                    )
+                ),
             ).as_dict(),
             "extra_python_paths": [],
         },
@@ -617,6 +625,13 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                     case_name="remote_case",
                     resource_request=ResourceRequest(workers=1, threads=1).as_dict(),
                     resource_context=revoked_context,
+                    control=ExecutionControl(
+                        cancellation=CancellationRef(
+                            backend="sqlite",
+                            path=str(project_root / ".blackbase" / "controls.sqlite"),
+                            namespace="redis-worker-project",
+                        )
+                    ),
                 ).as_dict(),
             },
         }
@@ -688,6 +703,13 @@ def build_solver(config=None, *, resource_context=None, component_overrides=None
                     },
                 },
             },
+            control=ExecutionControl(
+                cancellation=CancellationRef(
+                    backend="sqlite",
+                    path=str(project_root / ".blackbase" / "controls.sqlite"),
+                    namespace="worker-project",
+                )
+            ),
         ).as_dict(),
         "extra_python_paths": [],
     }

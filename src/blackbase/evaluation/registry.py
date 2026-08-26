@@ -27,6 +27,10 @@ from .state_transition import (
     StateTransitionRequest,
     StateTransitionResult,
 )
+from .conformance import (
+    CopyOnWriteConformanceReport,
+    verify_copy_on_write_predecessors,
+)
 
 
 EVALUATION_REJECTION_REASON_MAX_LENGTH = 2048
@@ -359,6 +363,18 @@ class BoundStateReleaseProvider:
             raise EvaluationProviderContractError(
                 "provider changed the release owner identity"
             )
+        requested_ids = set(request.state_ids)
+        if requested_ids:
+            resolved_ids = set(result.released_state_ids).union(
+                result.not_found_state_ids
+            )
+            if resolved_ids != requested_ids:
+                missing = sorted(requested_ids.difference(resolved_ids))
+                unexpected = sorted(resolved_ids.difference(requested_ids))
+                raise EvaluationProviderContractError(
+                    "targeted state release did not resolve every requested StateRef: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
         if result.binding is None:
             return result.with_binding(self.binding)
         if result.binding != self.binding:
@@ -374,6 +390,9 @@ class EvaluationProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, EvaluationProvider] = {}
         self._specs: dict[str, EvaluationProviderSpec] = {}
+        self._copy_on_write_certifications: dict[
+            tuple[str, str], CopyOnWriteConformanceReport
+        ] = {}
         self._lock = RLock()
 
     def register(self, provider: EvaluationProvider, *, replace: bool = False) -> None:
@@ -390,11 +409,26 @@ class EvaluationProviderRegistry:
                 )
             self._providers[spec.provider_id] = provider
             self._specs[spec.provider_id] = spec
+            if replace:
+                stale = [
+                    key
+                    for key in self._copy_on_write_certifications
+                    if key[0] == spec.provider_id
+                ]
+                for key in stale:
+                    self._copy_on_write_certifications.pop(key, None)
 
     def unregister(self, provider_id: str) -> EvaluationProvider | None:
         with self._lock:
             key = str(provider_id)
             self._specs.pop(key, None)
+            stale = [
+                item
+                for item in self._copy_on_write_certifications
+                if item[0] == key
+            ]
+            for item in stale:
+                self._copy_on_write_certifications.pop(item, None)
             return self._providers.pop(key, None)
 
     def get(self, provider_id: str) -> EvaluationProvider:
@@ -410,6 +444,37 @@ class EvaluationProviderRegistry:
         with self._lock:
             specs = tuple(self._specs.values())
         return tuple(sorted(specs, key=lambda item: item.provider_id))
+
+    def copy_on_write_certifications(
+        self,
+    ) -> tuple[CopyOnWriteConformanceReport, ...]:
+        """Return the immutable first-use certification audit."""
+
+        with self._lock:
+            reports = tuple(self._copy_on_write_certifications.values())
+        return tuple(
+            sorted(reports, key=lambda item: (item.provider_id, item.method_id))
+        )
+
+    def _requires_copy_on_write_certification(
+        self,
+        provider_id: str,
+        method_id: str,
+    ) -> bool:
+        with self._lock:
+            return (str(provider_id), str(method_id)) not in (
+                self._copy_on_write_certifications
+            )
+
+    def _record_copy_on_write_certification(
+        self,
+        report: CopyOnWriteConformanceReport,
+    ) -> None:
+        with self._lock:
+            self._copy_on_write_certifications.setdefault(
+                (report.provider_id, report.method_id),
+                report,
+            )
 
     def bind(
         self,
@@ -593,7 +658,24 @@ class EvaluationGateway:
         resource_context: ResourceContext | Mapping[str, Any] | None,
     ) -> StateTransitionResult:
         bound = self.registry.bind_transition(request, resource_context)
-        return bound.execute(request)
+        result = bound.execute(request)
+        provider_id = request.state_ref.provider_id
+        if (
+            result.status == "applied"
+            and bool(request.slot_refs)
+            and self.registry._requires_copy_on_write_certification(
+                provider_id,
+                request.method_id,
+            )
+        ):
+            report = verify_copy_on_write_predecessors(
+                self,
+                request,
+                result,
+                bound.binding.resource_context,
+            )
+            self.registry._record_copy_on_write_certification(report)
+        return result
 
     def materialize(
         self,
@@ -1040,11 +1122,12 @@ def _validate_transition_successor(
                 f"optimizer slot '{slot_name}' changed transport scope"
             )
         previous_slot = request.slot_refs.get(slot_name)
-        if previous_slot is None or slot.state_id != previous_slot.state_id:
+        if previous_slot is None:
             continue
-        if slot.version != previous_slot.version + 1:
+        if slot.state_id == previous_slot.state_id:
             raise EvaluationProviderContractError(
-                f"in-place optimizer slot '{slot_name}' must increment version by one"
+                f"applied optimizer slot '{slot_name}' must be copy-on-write; "
+                "return a successor with a new state_id so the caller can abort safely"
             )
 
 

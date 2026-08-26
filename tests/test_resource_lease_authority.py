@@ -146,15 +146,15 @@ def test_project_l0_guard_renews_and_detects_revoked_fence(tmp_path) -> None:
             namespace="guard-test",
             lease_backend="sqlite",
             lease_path="leases.sqlite",
-            lease_ttl_seconds=0.15,
-            lease_heartbeat_seconds=0.03,
+            lease_ttl_seconds=1.0,
+            lease_heartbeat_seconds=0.1,
         ),
         project_root=tmp_path,
     )
     lease = runtime.acquire_case("case-a", stage_name="stage")
     guard = runtime.start_lease_guard(lease)
     try:
-        time.sleep(0.22)
+        time.sleep(1.1)
         guard.assert_current()
         assert runtime.allocator.is_current(lease)
 
@@ -168,7 +168,7 @@ def test_project_l0_guard_renews_and_detects_revoked_fence(tmp_path) -> None:
         guard.close()
 
 
-def test_project_runner_keeps_short_ttl_lease_alive_until_case_finishes(tmp_path) -> None:
+def test_project_runner_keeps_safe_ttl_lease_alive_until_case_finishes(tmp_path) -> None:
     project_root = create_project(tmp_path / "lease_guard_project", framework="blackbase")
     case_root = add_case("slow_case", "solver", project_root=project_root)
     (case_root / "build_solver.py").write_text(
@@ -180,7 +180,7 @@ class Case:
         self.resource_context = dict(resource_context)
 
     def run(self):
-        time.sleep(0.22)
+        time.sleep(1.1)
         return {
             "fencing_token": self.resource_context["lease"]["fencing_token"],
             "expires_at": self.resource_context["lease"]["expires_at"],
@@ -202,8 +202,8 @@ L0 = {
     "default_request": {"workers": 1, "threads": 1, "memory_mb": 1},
     "lease_backend": "sqlite",
     "lease_path": ".blackbase/l0_leases.sqlite",
-    "lease_ttl_seconds": 0.12,
-    "lease_heartbeat_seconds": 0.03,
+    "lease_ttl_seconds": 1.0,
+    "lease_heartbeat_seconds": 0.1,
 }
 STAGES = [{"name": "slow", "cases": ["slow_case"]}]
 GROUPS = {"default": {"stages": ["slow"]}}
@@ -211,7 +211,7 @@ GROUPS = {"default": {"stages": ["slow"]}}
         encoding="utf-8",
     )
 
-    result = execute_project(project_root, run_id="short-ttl")
+    result = execute_project(project_root, run_id="safe-ttl")
 
     assert result.ok
     assert result.case_results[0].output["fencing_token"] > 0
@@ -279,6 +279,7 @@ def test_project_doctor_validates_durable_l0_lease_configuration(tmp_path) -> No
     generated = (project_root / "project_config.py").read_text(encoding="utf-8")
     assert '"lease_backend": "sqlite"' in generated
     assert '"lease_path": ".blackbase/l0_leases.sqlite"' in generated
+    assert '"control_active_ttl_seconds": 120' in generated
 
     (project_root / "project_config.py").write_text(
         """
@@ -287,6 +288,9 @@ L0 = {
     "lease_backend": "http",
     "lease_ttl_seconds": 0,
     "lease_heartbeat_seconds": 10,
+    "control_active_ttl_seconds": 0,
+    "control_heartbeat_seconds": 10,
+    "control_retention_seconds": -1,
 }
 STAGES = []
 GROUPS = {"default": {"stages": []}}
@@ -299,6 +303,9 @@ GROUPS = {"default": {"stages": []}}
     assert "project-l0-lease-backend-invalid" in codes
     assert "project-l0-lease-ttl-invalid" in codes
     assert "project-l0-lease-heartbeat-invalid" in codes
+    assert "project-l0-control-ttl-invalid" in codes
+    assert "project-l0-control-heartbeat-invalid" in codes
+    assert "project-l0-control-retention-invalid" in codes
 
 
 def test_project_doctor_requires_redis_lease_connection_source(tmp_path) -> None:
@@ -322,6 +329,48 @@ GROUPS = {"default": {"stages": []}}
     report = run_common_project_doctor(project_root, strict=True)
     codes = {item.code for item in report.diagnostics if item.level == "error"}
     assert "project-l0-lease-redis-connection-missing" in codes
+
+
+def test_project_runtime_and_doctor_reject_unsafe_lease_scheduling_margin(tmp_path) -> None:
+    project_root = create_project(tmp_path / "short_lease_project", framework="blackbase")
+    (project_root / "project_config.py").write_text(
+        '''
+PROJECT_NAME = "short_lease_project"
+L0 = {
+    "lease_backend": "sqlite",
+    "lease_ttl_seconds": 0.12,
+    "lease_heartbeat_seconds": 0.03,
+}
+STAGES = []
+GROUPS = {"default": {"stages": []}}
+''',
+        encoding="utf-8",
+    )
+
+    report = run_common_project_doctor(project_root, strict=True)
+    codes = {item.code for item in report.diagnostics if item.level == "error"}
+    assert "project-l0-lease-ttl-invalid" in codes
+
+    with pytest.raises(ValueError, match="at least 1 second"):
+        ProjectRuntimeConfig(
+            lease_ttl_seconds=0.12,
+            lease_heartbeat_seconds=0.03,
+        )
+
+    with pytest.raises(ValueError, match="no greater than"):
+        ProjectRuntimeConfig(
+            lease_ttl_seconds=1.0,
+            lease_heartbeat_seconds=0.5,
+        )
+
+    with pytest.raises(ValueError, match="control_active_ttl_seconds"):
+        ProjectRuntimeConfig(control_active_ttl_seconds=0)
+
+    with pytest.raises(ValueError, match="control_heartbeat_seconds"):
+        ProjectRuntimeConfig(
+            control_active_ttl_seconds=1.0,
+            control_heartbeat_seconds=0.6,
+        )
 
 
 def test_project_doctor_rejects_shared_budgets_without_durable_authority(tmp_path) -> None:

@@ -317,7 +317,12 @@ class BudgetAccount:
                 )
             return allowed
 
-    def reserve(self, amount: int) -> BudgetClaim:
+    def reserve(
+        self,
+        amount: int,
+        *,
+        reservation_id: str | None = None,
+    ) -> BudgetClaim:
         requested = int(amount)
         if requested < 0:
             raise ValueError("reservation amount must be non-negative")
@@ -326,7 +331,7 @@ class BudgetAccount:
                 raise ValueError("reservation exceeds the delegated budget handle")
             if requested == 0:
                 return BudgetClaim(
-                    claim_id=f"budget-zero-{uuid4().hex}",
+                    claim_id=str(reservation_id or f"budget-zero-{uuid4().hex}"),
                     budget=self.budget,
                     amount=0,
                     _account_id=self._account_id,
@@ -339,12 +344,20 @@ class BudgetAccount:
                     requested,
                     lease_id=self._lease_id,
                     fencing_token=self._fencing_token,
+                    reservation_id=reservation_id,
                 )
             claim_id = (
                 str(shared.reservation_id)
                 if shared is not None
-                else f"budget-local-{uuid4().hex}"
+                else str(reservation_id or f"budget-local-{uuid4().hex}")
             )
+            existing = self._claims.get(claim_id)
+            if existing is not None:
+                if existing.amount != requested:
+                    raise ValueError(
+                        "budget reservation_id was reused with a different amount"
+                    )
+                return existing
             claim = BudgetClaim(
                 claim_id=claim_id,
                 budget=self.budget,

@@ -43,6 +43,35 @@ from .state_transition import (
     StateTransitionResult,
     StateVersionConflict,
 )
+from .event import (
+    EVALUATION_DISPOSITION_SCHEMA_V1,
+    EVALUATION_DISPOSITION_VERIFICATION_SCHEMA_V1,
+    EVALUATION_DISPOSITION_VERIFICATION_SCHEMA_V2,
+    EVALUATION_EVENT_SCHEMA_V1,
+    EvaluationDispositionEnvelope,
+    EvaluationDispositionVerificationReceipt,
+    EvaluationEventEnvelope,
+    evaluation_disposition_digest,
+)
+from .conformance import (
+    CopyOnWriteConformanceReport,
+    EvaluationProviderConformanceError,
+    verify_copy_on_write_predecessors,
+)
+from .journal import (
+    EVALUATION_EVIDENCE_ACTIVE_STATUSES,
+    EVALUATION_EVIDENCE_RECORD_SCHEMA_V1,
+    EVALUATION_EVIDENCE_RECORD_SCHEMA_V2,
+    EVALUATION_EVIDENCE_TERMINAL_STATUSES,
+    EvaluationEvidenceConflict,
+    EvaluationEvidenceJournal,
+    EvaluationEvidenceRecord,
+    EvaluationEvidenceRevisionConflict,
+    InMemoryEvaluationEvidenceJournal,
+    RedisEvaluationEvidenceJournal,
+    SQLiteEvaluationEvidenceJournal,
+    create_evaluation_evidence_journal,
+)
 
 
 __all__ = [
@@ -67,6 +96,28 @@ __all__ = [
     "EVALUATION_REJECTION_REASON_MAX_LENGTH",
     "EvaluationRequest",
     "EvaluationResult",
+    "EVALUATION_DISPOSITION_SCHEMA_V1",
+    "EVALUATION_DISPOSITION_VERIFICATION_SCHEMA_V1",
+    "EVALUATION_DISPOSITION_VERIFICATION_SCHEMA_V2",
+    "EVALUATION_EVENT_SCHEMA_V1",
+    "EvaluationDispositionEnvelope",
+    "EvaluationDispositionVerificationReceipt",
+    "EvaluationEventEnvelope",
+    "evaluation_disposition_digest",
+    "EVALUATION_EVIDENCE_ACTIVE_STATUSES",
+    "EVALUATION_EVIDENCE_RECORD_SCHEMA_V1",
+    "EVALUATION_EVIDENCE_RECORD_SCHEMA_V2",
+    "EVALUATION_EVIDENCE_TERMINAL_STATUSES",
+    "EvaluationEvidenceConflict",
+    "EvaluationEvidenceJournal",
+    "EvaluationEvidenceRecord",
+    "EvaluationEvidenceRevisionConflict",
+    "InMemoryEvaluationEvidenceJournal",
+    "RedisEvaluationEvidenceJournal",
+    "SQLiteEvaluationEvidenceJournal",
+    "create_evaluation_evidence_journal",
+    "CopyOnWriteConformanceReport",
+    "EvaluationProviderConformanceError",
     "STATE_MATERIALIZATION_TARGETS",
     "STATE_RELEASE_STATUSES",
     "STATE_TRANSITION_STATUSES",
@@ -81,4 +132,5 @@ __all__ = [
     "StateTransitionRequest",
     "StateTransitionResult",
     "StateVersionConflict",
+    "verify_copy_on_write_predecessors",
 ]

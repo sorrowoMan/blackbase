@@ -24,6 +24,7 @@ from uuid import uuid4
 
 from blackbase.resources import (
     ArtifactAuthority,
+    CancellationHeartbeat,
     CancellationRef,
     CancellationToken,
     InMemoryLeaseStore,
@@ -38,6 +39,7 @@ from blackbase.resources import (
     SQLiteBudgetAuthority,
     SQLiteLeaseStore,
     TerminationPolicy,
+    build_cancellation_store,
 )
 
 from .case_binding import bind_case_resource_context
@@ -68,6 +70,8 @@ _CASE_LOCAL_MODULE_ROOTS = {
     "working_nested_optimizer",
 }
 _PROJECT_IMPORT_LOCK = threading.RLock()
+MIN_PROJECT_LEASE_TTL_SECONDS = 1.0
+MIN_PROJECT_LEASE_HEARTBEAT_RATIO = 3.0
 
 
 def text_declares_check_argument(text: str) -> bool:
@@ -196,6 +200,9 @@ class ProjectRuntimeConfig:
     budgets: Mapping[str, int] = field(default_factory=dict)
     budget_scope: str = ""
     control_path: str = ".blackbase/l0_controls.sqlite"
+    control_active_ttl_seconds: float = 120.0
+    control_heartbeat_seconds: float = 30.0
+    control_retention_seconds: float = 0.0
     artifact_path: str = ".blackbase/artifacts"
     artifact_allow_unsafe_serializers: bool = False
     termination: TerminationPolicy = field(default_factory=TerminationPolicy)
@@ -206,6 +213,9 @@ class ProjectRuntimeConfig:
         redis_url_env = str(self.lease_redis_url_env or "").strip()
         ttl = float(self.lease_ttl_seconds)
         heartbeat = float(self.lease_heartbeat_seconds)
+        control_ttl = float(self.control_active_ttl_seconds)
+        control_heartbeat = float(self.control_heartbeat_seconds)
+        control_retention = float(self.control_retention_seconds)
         budgets = {
             str(name).strip(): int(limit)
             for name, limit in dict(self.budgets or {}).items()
@@ -218,11 +228,15 @@ class ProjectRuntimeConfig:
         )
         if backend not in {"memory", "sqlite", "redis"}:
             raise ValueError("L0.lease_backend must be 'memory', 'sqlite', or 'redis'")
-        if ttl <= 0:
-            raise ValueError("L0.lease_ttl_seconds must be positive")
-        if heartbeat <= 0 or heartbeat >= ttl:
+        if ttl < MIN_PROJECT_LEASE_TTL_SECONDS:
             raise ValueError(
-                "L0.lease_heartbeat_seconds must be positive and smaller than lease_ttl_seconds"
+                "L0.lease_ttl_seconds must be at least "
+                f"{MIN_PROJECT_LEASE_TTL_SECONDS:g} second for Project execution"
+            )
+        if heartbeat <= 0 or heartbeat * MIN_PROJECT_LEASE_HEARTBEAT_RATIO > ttl:
+            raise ValueError(
+                "L0.lease_heartbeat_seconds must be positive and no greater than "
+                f"lease_ttl_seconds / {MIN_PROJECT_LEASE_HEARTBEAT_RATIO:g}"
             )
         if backend == "redis" and not redis_url and not redis_url_env:
             raise ValueError(
@@ -231,6 +245,15 @@ class ProjectRuntimeConfig:
             )
         if any(limit < 0 for limit in budgets.values()):
             raise ValueError("L0.budgets limits must be non-negative")
+        if control_ttl <= 0:
+            raise ValueError("L0.control_active_ttl_seconds must be positive")
+        if control_heartbeat <= 0 or control_heartbeat * 2 > control_ttl:
+            raise ValueError(
+                "L0.control_heartbeat_seconds must be positive and no greater than "
+                "control_active_ttl_seconds / 2"
+            )
+        if control_retention < 0:
+            raise ValueError("L0.control_retention_seconds must be non-negative")
         if budgets and backend == "memory":
             raise ValueError(
                 "L0.budgets requires lease_backend='sqlite' or 'redis' for shared authority"
@@ -244,6 +267,9 @@ class ProjectRuntimeConfig:
         object.__setattr__(self, "budgets", budgets)
         object.__setattr__(self, "budget_scope", str(self.budget_scope or "").strip())
         object.__setattr__(self, "control_path", str(self.control_path or ".blackbase/l0_controls.sqlite"))
+        object.__setattr__(self, "control_active_ttl_seconds", control_ttl)
+        object.__setattr__(self, "control_heartbeat_seconds", control_heartbeat)
+        object.__setattr__(self, "control_retention_seconds", control_retention)
         object.__setattr__(self, "artifact_path", str(self.artifact_path or ".blackbase/artifacts"))
         object.__setattr__(
             self,
@@ -281,11 +307,14 @@ def load_project_runtime_config(module: Any) -> ProjectRuntimeConfig:
         lease_path=str(l0.get("lease_path", ".blackbase/l0_leases.sqlite")),
         lease_redis_url=str(l0.get("lease_redis_url", "")),
         lease_redis_url_env=str(l0.get("lease_redis_url_env", "BLACKBASE_REDIS_URL")),
-        lease_ttl_seconds=float(l0.get("lease_ttl_seconds", 30.0) or 30.0),
-        lease_heartbeat_seconds=float(l0.get("lease_heartbeat_seconds", 10.0) or 10.0),
+        lease_ttl_seconds=float(l0.get("lease_ttl_seconds", 30.0)),
+        lease_heartbeat_seconds=float(l0.get("lease_heartbeat_seconds", 10.0)),
         budgets=dict(l0.get("budgets", {}) or {}),
         budget_scope=str(l0.get("budget_scope", "") or ""),
         control_path=str(l0.get("control_path", ".blackbase/l0_controls.sqlite")),
+        control_active_ttl_seconds=float(l0.get("control_active_ttl_seconds", 120.0)),
+        control_heartbeat_seconds=float(l0.get("control_heartbeat_seconds", 30.0)),
+        control_retention_seconds=float(l0.get("control_retention_seconds", 0.0)),
         artifact_path=str(artifact_payload.get("path", ".blackbase/artifacts")),
         artifact_allow_unsafe_serializers=bool(
             artifact_payload.get("allow_unsafe_serializers", False)
@@ -301,12 +330,19 @@ class ResourceLeaseFenceError(RuntimeError):
 class ResourceLeaseGuard:
     """Renews one Project L0 lease and records loss of authority."""
 
-    def __init__(self, runtime: "ProjectL0Runtime", lease: ResourceLease) -> None:
+    def __init__(
+        self,
+        runtime: "ProjectL0Runtime",
+        lease: ResourceLease,
+        *,
+        cancellation_ref: CancellationRef | None = None,
+    ) -> None:
         self.runtime = runtime
         self.lease = lease
         self._lease_lock = threading.RLock()
         self._stop = threading.Event()
         self._lost = threading.Event()
+        self._control_heartbeat: CancellationHeartbeat | None = None
         renewed = self.runtime.allocator.renew(self.lease)
         if renewed is None:
             self._lost.set()
@@ -317,6 +353,13 @@ class ResourceLeaseGuard:
             name=f"blackbase-l0-heartbeat-{lease.lease_id}",
             daemon=True,
         )
+        if cancellation_ref is not None:
+            self._control_heartbeat = CancellationHeartbeat(
+                CancellationToken(
+                    cancellation_ref,
+                    redis_client=self.runtime._cancellation_redis_client,
+                )
+            )
         if not self._lost.is_set():
             self._thread.start()
 
@@ -343,6 +386,8 @@ class ResourceLeaseGuard:
                 f"Project L0 lease fence is no longer current: "
                 f"lease_id='{lease.lease_id}' token={lease.fencing_token}"
             )
+        if self._control_heartbeat is not None:
+            self._control_heartbeat.assert_current()
 
     def close(self) -> None:
         self._stop.set()
@@ -350,6 +395,8 @@ class ResourceLeaseGuard:
             self._thread.join(
                 timeout=max(0.1, self.runtime.config.lease_heartbeat_seconds * 2.0)
             )
+        if self._control_heartbeat is not None:
+            self._control_heartbeat.close()
 
 
 class ProjectL0Runtime:
@@ -389,6 +436,9 @@ class ProjectL0Runtime:
         budget_scope = self.config.budget_scope or f"run-{uuid4().hex}"
         self.budget_authority = None
         self._cancellation_redis_client = None
+        self._issued_cancellation_refs: dict[str, CancellationRef] = {}
+        self._cancellation_lock = threading.RLock()
+        self._closed = False
         self.budget_authority_metadata: dict[str, Any] = {}
         if lease_backend == "sqlite":
             lease_path = Path(self.config.lease_path)
@@ -504,6 +554,9 @@ class ProjectL0Runtime:
                 namespace=self.config.namespace,
                 redis_url_env=self.config.lease_redis_url_env,
                 deadline_at=deadline_at,
+                active_ttl_seconds=self.config.control_active_ttl_seconds,
+                heartbeat_seconds=self.config.control_heartbeat_seconds,
+                retention_seconds=self.config.control_retention_seconds,
             )
         else:
             control_path = Path(self.config.control_path)
@@ -514,8 +567,15 @@ class ProjectL0Runtime:
                 namespace=self.config.namespace,
                 path=str(control_path.resolve()),
                 deadline_at=deadline_at,
+                active_ttl_seconds=self.config.control_active_ttl_seconds,
+                heartbeat_seconds=self.config.control_heartbeat_seconds,
+                retention_seconds=self.config.control_retention_seconds,
             )
         CancellationToken(ref, redis_client=self._cancellation_redis_client)
+        with self._cancellation_lock:
+            if self._closed:
+                raise RuntimeError("Project L0 runtime is closed")
+            self._issued_cancellation_refs[ref.control_id] = ref
         return ref
 
     def acquire_case(
@@ -535,8 +595,47 @@ class ProjectL0Runtime:
     def release(self, lease: ResourceLease | Mapping[str, Any] | str) -> None:
         self.allocator.release(lease)
 
-    def start_lease_guard(self, lease: ResourceLease) -> ResourceLeaseGuard:
-        return ResourceLeaseGuard(self, lease)
+    def start_lease_guard(
+        self,
+        lease: ResourceLease,
+        *,
+        cancellation_ref: CancellationRef | None = None,
+    ) -> ResourceLeaseGuard:
+        return ResourceLeaseGuard(
+            self,
+            lease,
+            cancellation_ref=cancellation_ref,
+        )
+
+    def retire_cancellation(self, ref: CancellationRef) -> None:
+        store = build_cancellation_store(
+            ref,
+            redis_client=self._cancellation_redis_client,
+        )
+        store.retire(ref)
+        with self._cancellation_lock:
+            self._issued_cancellation_refs.pop(ref.control_id, None)
+
+    def close(self) -> None:
+        with self._cancellation_lock:
+            if self._closed:
+                return
+            self._closed = True
+            refs = tuple(self._issued_cancellation_refs.values())
+            self._issued_cancellation_refs.clear()
+        failures: list[BaseException] = []
+        for ref in refs:
+            try:
+                build_cancellation_store(
+                    ref,
+                    redis_client=self._cancellation_redis_client,
+                ).retire(ref)
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError(
+                f"failed to retire {len(failures)} Project cancellation control(s)"
+            ) from failures[0]
 
     def assert_current(self, lease: ResourceLease | Mapping[str, Any]) -> None:
         item = lease if isinstance(lease, ResourceLease) else ResourceLease.from_dict(lease)

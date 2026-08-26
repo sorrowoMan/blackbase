@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from concurrent.futures import (
     CancelledError,
@@ -38,7 +39,7 @@ class PoolTask(Generic[T]):
         self._exception: Optional[BaseException] = None
         self._done = threading.Event()
         self._started = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @property
     def done(self) -> bool:
@@ -198,21 +199,29 @@ class PoolScheduler:
                 "PoolScheduler; derive a child resource context instead"
             )
         task: PoolTask[T] = PoolTask(fn, *args, **kwargs)
+        if not self._acquire_capacity(permit_count, task):
+            raise RuntimeError("PoolScheduler was shutdown before task admission")
+        reservation_lock = threading.Lock()
+        reservation_active = True
+
+        def release_reservation() -> None:
+            nonlocal reservation_active
+            with reservation_lock:
+                if not reservation_active:
+                    return
+                reservation_active = False
+            self._release_capacity(permit_count)
+
         result = PoolResult(
             task,
             worker_id="",
             task_id=str(task_id or ""),
-            cancel_callback=self._notify_capacity_waiters,
+            cancel_callback=release_reservation,
         )
 
         def wrapper() -> None:
-            acquired = False
             previous_permits = int(getattr(self._task_local, "held_permits", 0))
             try:
-                acquired = self._acquire_capacity(permit_count, task)
-                if not acquired:
-                    task.cancel()
-                    return
                 if not task._mark_started():
                     return
                 result.start_time = time.time()
@@ -220,29 +229,36 @@ class PoolScheduler:
                 result.worker_id = f"pool-{ident}"
                 self._task_local.held_permits = previous_permits + permit_count
                 raw_result = fn(*args, **kwargs)
-                task._set_result(raw_result)
                 with self._lock:
                     self._tasks_completed += 1
+                # Publish completion only after scheduler accounting is
+                # visible; PoolResult.result() is the synchronization barrier.
+                task._set_result(raw_result)
                 return raw_result
             except BaseException as exc:
-                task._set_exception(exc)
                 with self._lock:
                     self._tasks_failed += 1
+                task._set_exception(exc)
             finally:
                 result.end_time = time.time()
                 self._task_local.held_permits = previous_permits
-                if acquired:
-                    self._release_capacity(permit_count)
+                release_reservation()
 
-        with self._lock:
-            if self._shutdown:
-                raise RuntimeError("PoolScheduler has been shutdown")
-            self._tasks_submitted += 1
-            future = self._executor.submit(wrapper)
-            self._future_tasks[future] = task
-            result._future = future
+        try:
+            with self._lock:
+                if self._shutdown:
+                    raise RuntimeError("PoolScheduler has been shutdown")
+                self._tasks_submitted += 1
+                future = self._executor.submit(wrapper)
+                self._future_tasks[future] = task
+                result._future = future
+        except BaseException:
+            release_reservation()
+            raise
 
         def discard_future(done: Future[Any]) -> None:
+            if done.cancelled():
+                release_reservation()
             with self._lock:
                 self._future_tasks.pop(done, None)
 
@@ -259,10 +275,14 @@ class PoolScheduler:
                 self._entered = False
                 self._closed = False
                 self._reserved = False
-                self._executor: Optional[ThreadPoolExecutor] = None
                 self._lease_task: PoolTask[None] = PoolTask(lambda: None)
-                self._view_lock = threading.Lock()
-                self._tasks: dict[Future[Any], PoolTask[Any]] = {}
+                self._view_lock = threading.RLock()
+                self._view_changed = threading.Condition(self._view_lock)
+                self._pending: deque[
+                    tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+                ] = deque()
+                self._inflight: dict[Future[Any], tuple[Future[Any], PoolTask[Any]]] = {}
+                self._all_futures: set[Future[Any]] = set()
 
             def __enter__(self) -> "_PoolExecutor":
                 if int(getattr(self._pool._task_local, "held_permits", 0)) > 0:
@@ -281,14 +301,8 @@ class PoolScheduler:
                     self._lease_task,
                 ):
                     raise RuntimeError("PoolScheduler was shutdown before executor admission")
-                executor: Optional[ThreadPoolExecutor] = None
                 try:
-                    executor = ThreadPoolExecutor(
-                        max_workers=self._worker_count,
-                        thread_name_prefix="blackbase-pool-view",
-                    )
                     with self._view_lock:
-                        self._executor = executor
                         self._reserved = True
                         self._entered = True
                     with self._pool._lock:
@@ -297,12 +311,9 @@ class PoolScheduler:
                         self._pool._executor_views.add(self)
                 except BaseException:
                     with self._view_lock:
-                        self._executor = None
                         self._reserved = False
                         self._entered = False
                         self._closed = True
-                    if executor is not None:
-                        executor.shutdown(wait=True, cancel_futures=True)
                     self._pool._release_capacity(self._worker_count)
                     raise
                 return self
@@ -315,60 +326,121 @@ class PoolScheduler:
                         "executor submit cannot be called from a task running in the same "
                         "PoolScheduler; derive a child resource context instead"
                     )
-                task: PoolTask[T] = PoolTask(fn, *args, **kwargs)
-
-                def wrapper() -> T:
-                    previous_permits = int(
-                        getattr(self._pool._task_local, "held_permits", 0)
-                    )
-                    try:
-                        if not task._mark_started():
-                            raise CancelledError(
-                                "Pool executor task was cancelled before execution"
-                            )
-                        self._pool._task_local.held_permits = previous_permits + 1
-                        raw_result = fn(*args, **kwargs)
-                        task._set_result(raw_result)
-                        with self._pool._lock:
-                            self._pool._tasks_completed += 1
-                        return raw_result
-                    except BaseException as exc:
-                        task._set_exception(exc)
-                        if not isinstance(exc, CancelledError):
-                            with self._pool._lock:
-                                self._pool._tasks_failed += 1
-                        raise
-                    finally:
-                        self._pool._task_local.held_permits = previous_permits
-
                 with self._view_lock:
-                    executor = self._executor
-                    if not self._entered or self._closed or executor is None:
+                    if not self._entered or self._closed:
                         raise RuntimeError("executor view is not active")
                     with self._pool._lock:
                         if self._pool._shutdown:
                             raise RuntimeError("PoolScheduler has been shutdown")
-                        future: Future[T] = executor.submit(wrapper)
-                        self._pool._tasks_submitted += 1
-                        self._pool._future_tasks[future] = task
-                    self._tasks[future] = task
+                    outer: Future[T] = Future()
+                    self._all_futures.add(outer)
+                    self._pending.append((outer, fn, tuple(args), dict(kwargs)))
+                    self._launch_available_locked()
+                outer.add_done_callback(self._discard_outer_future)
+                return outer
 
-                def discard_future(done: Future[Any]) -> None:
+            def _discard_outer_future(self, done: Future[Any]) -> None:
+                with self._view_lock:
+                    self._all_futures.discard(done)
+                self._release_reservation_if_idle()
+
+            def _launch_available_locked(self) -> None:
+                while (
+                    self._entered
+                    and self._reserved
+                    and len(self._inflight) < self._worker_count
+                    and self._pending
+                ):
+                    outer, fn, args, kwargs = self._pending.popleft()
+                    if outer.cancelled():
+                        continue
+                    task: PoolTask[Any] = PoolTask(fn, *args, **kwargs)
+
+                    def wrapper(
+                        *,
+                        _outer: Future[Any] = outer,
+                        _task: PoolTask[Any] = task,
+                        _fn: Callable[..., Any] = fn,
+                        _args: tuple[Any, ...] = args,
+                        _kwargs: dict[str, Any] = kwargs,
+                    ) -> Any:
+                        previous_permits = int(
+                            getattr(self._pool._task_local, "held_permits", 0)
+                        )
+                        try:
+                            if not _outer.set_running_or_notify_cancel():
+                                _task.cancel()
+                                raise CancelledError(
+                                    "Pool executor task was cancelled before execution"
+                                )
+                            if not _task._mark_started():
+                                raise CancelledError(
+                                    "Pool executor task was cancelled before execution"
+                                )
+                            self._pool._task_local.held_permits = previous_permits + 1
+                            raw_result = _fn(*_args, **_kwargs)
+                            with self._pool._lock:
+                                self._pool._tasks_completed += 1
+                            # Audit state is committed before either public
+                            # completion primitive is published.  result()
+                            # and callbacks are therefore synchronization
+                            # barriers for scheduler evidence too.
+                            _task._set_result(raw_result)
+                            _outer.set_result(raw_result)
+                            return raw_result
+                        except BaseException as exc:
+                            if not isinstance(exc, CancelledError):
+                                with self._pool._lock:
+                                    self._pool._tasks_failed += 1
+                            _task._set_exception(exc)
+                            if not _outer.done():
+                                _outer.set_exception(exc)
+                            raise
+                        finally:
+                            self._pool._task_local.held_permits = previous_permits
+
                     with self._pool._lock:
-                        self._pool._future_tasks.pop(done, None)
-                    with self._view_lock:
-                        self._tasks.pop(done, None)
-                    self._release_reservation_if_idle()
+                        if self._pool._shutdown:
+                            outer.set_exception(
+                                RuntimeError("PoolScheduler has been shutdown")
+                            )
+                            continue
+                        underlying = self._pool._executor.submit(wrapper)
+                        self._pool._tasks_submitted += 1
+                        self._pool._future_tasks[underlying] = task
+                    self._inflight[outer] = (underlying, task)
+                    underlying.add_done_callback(
+                        lambda done, _outer=outer: self._underlying_done(
+                            _outer,
+                            done,
+                        )
+                    )
 
-                future.add_done_callback(discard_future)
-                return future
+            def _underlying_done(
+                self,
+                outer: Future[Any],
+                done: Future[Any],
+            ) -> None:
+                with self._view_lock:
+                    self._inflight.pop(outer, None)
+                    if done.cancelled() and not outer.done():
+                        outer.cancel()
+                    self._launch_available_locked()
+                    self._view_changed.notify_all()
+                with self._pool._lock:
+                    self._pool._future_tasks.pop(done, None)
+                self._release_reservation_if_idle()
 
             def _release_reservation_if_idle(self) -> None:
                 release = False
                 with self._view_lock:
-                    if self._closed and self._reserved and not self._tasks:
+                    if (
+                        self._closed
+                        and self._reserved
+                        and not self._pending
+                        and not self._inflight
+                    ):
                         self._reserved = False
-                        self._executor = None
                         release = True
                 if not release:
                     return
@@ -379,17 +451,29 @@ class PoolScheduler:
             def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
                 with self._view_lock:
                     self._closed = True
-                    pending = tuple(self._tasks.items())
-                    executor = self._executor
+                    pending = tuple(item[0] for item in self._pending)
+                    inflight = tuple(self._inflight.items())
+                    all_futures = tuple(self._all_futures)
                 if cancel_futures:
-                    for future, task in pending:
-                        task.cancel()
+                    for future in pending:
                         future.cancel()
-                    self._pool._notify_capacity_waiters()
-                if executor is not None:
-                    executor.shutdown(wait=wait, cancel_futures=cancel_futures)
-                elif wait and pending:
-                    wait_futures(tuple(future for future, _task in pending))
+                    for outer, (underlying, task) in inflight:
+                        task.cancel()
+                        outer.cancel()
+                        underlying.cancel()
+                    with self._view_lock:
+                        self._pending = deque(
+                            item for item in self._pending if not item[0].cancelled()
+                        )
+                else:
+                    with self._view_lock:
+                        self._launch_available_locked()
+                if wait and all_futures:
+                    wait_futures(all_futures)
+                if wait:
+                    with self._view_changed:
+                        while self._pending or self._inflight:
+                            self._view_changed.wait(timeout=0.05)
                 self._release_reservation_if_idle()
 
             def __exit__(self, exc_type, exc_val, exc_tb) -> None:

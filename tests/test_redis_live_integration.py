@@ -8,12 +8,23 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import pytest
 
+from blackbase.context import RedisContextStore, RedisSnapshotStore
 from blackbase.project.external_worker import ExternalCaseWorker
+from blackbase.evaluation import (
+    EvaluationDispositionEnvelope,
+    EvaluationDispositionVerificationReceipt,
+    RedisEvaluationEvidenceJournal,
+    evaluation_disposition_digest,
+)
 from blackbase.project.project_runner import execute_project
 from blackbase.project.scaffold import add_case, create_project
 from blackbase.resources import (
+    CancellationHeartbeat,
+    CancellationRef,
+    CancellationToken,
     RedisBudgetAuthority,
     RedisLeaseStore,
     RedisTaskTransport,
@@ -29,6 +40,7 @@ from blackbase.resources import (
     TaskResult,
     WorkerDescriptor,
 )
+from blackbase.types import UnknownState
 
 
 REDIS_URL = str(os.environ.get("BLACKBASE_TEST_REDIS_URL", "") or "").strip()
@@ -58,6 +70,147 @@ def _allocator(namespace: str, *, ttl_seconds: float) -> ResourceAllocator:
         lease_store=RedisLeaseStore(REDIS_URL, namespace=namespace),
         lease_ttl_seconds=ttl_seconds,
     )
+
+
+def test_live_redis_evaluation_evidence_journal_is_durable_and_atomic() -> None:
+    namespace = f"live-evaluation-evidence-{uuid4().hex}"
+    prefix = f"blackbase:test:{namespace}"
+    client = _redis_client()
+    journal = RedisEvaluationEvidenceJournal(
+        redis_url=REDIS_URL,
+        key_prefix=prefix,
+    )
+    try:
+        assert client.ping()
+        reserved = journal.reserve(
+            event_id="event-1",
+            run_id="run-1",
+            event_snapshot_key="events/event-1",
+        )
+        pending = journal.mark_event_durable(
+            "event-1",
+            expected_revision=reserved.revision,
+        )
+        disposition = EvaluationDispositionEnvelope(
+                event_id="event-1",
+                status="committed",
+                disposition_codec="test/v1",
+                disposition_payload={"accepted_indices": [0]},
+                event_snapshot_key="events/event-1",
+                authority_snapshot_key="authority/event-1",
+            )
+        deciding = journal.prepare_disposition(
+            disposition,
+            expected_revision=pending.revision,
+        )
+        assert journal.settle(
+            "event-1",
+            verification=EvaluationDispositionVerificationReceipt(
+                event_id="event-1",
+                event_snapshot_key="events/event-1",
+                destination_snapshot_key="authority/event-1",
+                disposition_digest=evaluation_disposition_digest(disposition),
+                verifier="test.redis_snapshot_store",
+                verified_at=time.time(),
+            ),
+            expected_revision=deciding.revision,
+        ).status == "committed"
+        reopened = RedisEvaluationEvidenceJournal(
+            redis_url=REDIS_URL,
+            key_prefix=prefix,
+        )
+        assert reopened.get("event-1").status == "committed"
+    finally:
+        _cleanup_keys(client, f"{prefix}:*")
+
+
+def test_live_redis_cancellation_control_is_heartbeated_and_retired() -> None:
+    suffix = uuid4().hex
+    namespace = f"live-control-{suffix}"
+    client = _redis_client()
+    ref = CancellationRef(
+        backend="redis",
+        namespace=namespace,
+        redis_url_env="BLACKBASE_TEST_REDIS_URL",
+        active_ttl_seconds=1.0,
+        heartbeat_seconds=0.2,
+        retention_seconds=2.0,
+    )
+    token = CancellationToken(ref)
+    heartbeat = CancellationHeartbeat(token)
+    key = f"blackbase:{namespace}:control:{ref.control_id}"
+    try:
+        assert client.ttl(key) > 0
+        time.sleep(1.2)
+        heartbeat.assert_current()
+        assert client.exists(key) == 1
+        assert client.ttl(key) > 0
+        assert token.cancel("live cancellation") is True
+        assert token.cancelled is True
+        assert client.ttl(key) > 0
+    finally:
+        heartbeat.close()
+        token.retire()
+        assert client.exists(key) == 1
+        assert token.touch() is False
+        assert token.cancel("late cancellation") is False
+        _cleanup_keys(client, f"blackbase:{namespace}:control:*")
+    assert client.exists(key) == 0
+
+
+def test_live_redis_context_and_safe_snapshot_preserve_protocol_values() -> None:
+    suffix = uuid4().hex
+    context_prefix = f"blackbase:live-context:{suffix}"
+    snapshot_prefix = f"blackbase:live-snapshot:{suffix}"
+    client = _redis_client()
+    context = RedisContextStore(
+        redis_url=REDIS_URL,
+        key_prefix=context_prefix,
+    )
+    snapshots = RedisSnapshotStore(
+        redis_url=REDIS_URL,
+        key_prefix=snapshot_prefix,
+        serializer="safe",
+    )
+    try:
+        context.set("project.signal", {"ready": True})
+        context.apply_patch({"generation": 4, "phase": "committed"})
+        raw_context = client.get(f"{context_prefix}:project.signal")
+        assert raw_context is not None
+        context_envelope = json.loads(raw_context.decode("utf-8"))
+        assert context_envelope["serializer"] == "safe"
+        assert context_envelope["scope"] == "context"
+        assert context.snapshot() == {
+            "project.signal": {"ready": True},
+            "generation": 4,
+            "phase": "committed",
+        }
+        context._redis.connection_pool.disconnect()
+        assert context.get("generation") == 4
+
+        state = UnknownState(
+            values=np.asarray([1.5, 2.5], dtype=np.float32),
+            metadata={
+                "source": "live-redis",
+                "mask": np.asarray([1, 0], dtype=np.int8),
+            },
+        )
+        handle = snapshots.write(
+            {"candidates": (state,)},
+            key="population",
+            schema="blackbase.live_snapshot/v1",
+        )
+        restored = snapshots.read(handle.key).data["candidates"][0]
+        assert isinstance(restored, UnknownState)
+        assert np.allclose(restored.as_array(), [1.5, 2.5])
+        assert restored.metadata["source"] == "live-redis"
+        assert np.array_equal(restored.metadata["mask"], [1, 0])
+    finally:
+        _cleanup_keys(
+            client,
+            f"{context_prefix}:*",
+            f"{snapshot_prefix}:*",
+        )
 
 
 def test_live_redis_lease_admission_ttl_and_fencing() -> None:
@@ -257,7 +410,7 @@ GROUPS = {{"default": {{"stages": ["external"]}}}}
 
         assert not worker_thread.is_alive()
         assert result.ok
-        assert result.case_results[0].status == "ok"
+        assert result.case_results[0].status == "succeeded"
         output = result.case_results[0].output
         assert output["fencing_token"] > 0
         record = transport.get(f"project:live-{suffix}:external:remote_case")
@@ -267,12 +420,19 @@ GROUPS = {{"default": {{"stages": ["external"]}}}}
         assert record.result.metadata["fencing_token"] == output["fencing_token"]
         manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
         assert REDIS_URL not in json.dumps(manifest, ensure_ascii=False)
+        assert not list(
+            client.scan_iter(
+                match=f"blackbase:{lease_namespace}:control:*",
+                count=100,
+            )
+        )
     finally:
         stop_worker.set()
         worker_thread.join(timeout=2.0)
         _cleanup_keys(
             client,
             f"blackbase:l0_leases:{lease_namespace}:*",
+            f"blackbase:{lease_namespace}:control:*",
             f"{task_namespace}:*",
         )
 

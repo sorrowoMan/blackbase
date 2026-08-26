@@ -11,12 +11,129 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from blackbase.resources import DataRef
+from blackbase.resources import CancellationRef, DataRef
 
 from .execution import CaseRunRequest, CaseRunResult, ProjectConfigurationError
 
 
 MANIFEST_SCHEMA_VERSION = 2
+
+
+def _migrate_historical_case_result_v1_to_v2(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compact one completed v1 result for manifest-only resume.
+
+    A live v1 request cannot be upgraded safely because its transported
+    ancestor token list has no registered v2 parent authority. Completed
+    manifest results no longer execute, so their lineage can be reduced to
+    bounded evidence while preserving the effective historical deadline.
+    """
+
+    migrated = dict(payload or {})
+    if int(migrated.get("schema_version", 0) or 0) != 1:
+        return migrated
+    request = dict(migrated.get("request", {}) or {})
+    if int(request.get("schema_version", 0) or 0) != 1:
+        raise ValueError("CaseRunResult v1 contains a non-v1 request envelope")
+    control = dict(request.get("control", {}) or {})
+    raw_current = dict(control.get("cancellation", {}) or {})
+    raw_ancestors = [
+        dict(item or {})
+        for item in tuple(control.get("ancestor_cancellations", ()) or ())
+        if isinstance(item, Mapping)
+    ]
+    lineage_payload = [*raw_ancestors, raw_current]
+    lineage_digest = hashlib.sha256(
+        json.dumps(
+            lineage_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    deadlines = [
+        float(item.get("deadline_at", 0.0) or 0.0)
+        for item in lineage_payload
+        if float(item.get("deadline_at", 0.0) or 0.0) > 0.0
+    ]
+    current = CancellationRef.from_dict(raw_current or {}).as_dict()
+    current["deadline_at"] = min(deadlines) if deadlines else 0.0
+    current["parent_control_id"] = None
+    current["root_control_id"] = current["control_id"]
+    current["lineage_depth"] = 0
+    current["lineage_digest"] = CancellationRef.from_dict(current).lineage_digest
+    control_metadata = dict(control.get("metadata", {}) or {})
+    control_metadata["historical_v1_lineage"] = {
+        "ancestor_count": len(raw_ancestors),
+        "digest": lineage_digest,
+        "migration": "manifest_resume_only",
+    }
+    control["cancellation"] = current
+    control["ancestor_cancellations"] = []
+    control["metadata"] = control_metadata
+    request_metadata = dict(request.get("metadata", {}) or {})
+    request_metadata["case_run_schema_migration"] = {
+        "from": 1,
+        "to": 2,
+        "mode": "historical_manifest_result",
+    }
+    request["control"] = control
+    request["metadata"] = request_metadata
+    request["schema_version"] = 2
+    result_metadata = dict(migrated.get("metadata", {}) or {})
+    result_metadata["case_run_schema_migration"] = {
+        "from": 1,
+        "to": 2,
+        "mode": "historical_manifest_result",
+    }
+    migrated["request"] = request
+    migrated["metadata"] = result_metadata
+    migrated["schema_version"] = 2
+    return migrated
+
+
+def _migrate_historical_case_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Upgrade completed manifest evidence without trusting old input refs.
+
+    Live pre-v3 requests remain rejected. A completed result is safe to retain as
+    history, but its old bare ``input_artifacts`` cannot be promoted back into an
+    authority capability, so those refs move into explicit audit metadata.
+    """
+
+    migrated = dict(payload or {})
+    original_version = int(migrated.get("schema_version", 0) or 0)
+    if original_version == 1:
+        migrated = _migrate_historical_case_result_v1_to_v2(migrated)
+    if int(migrated.get("schema_version", 0) or 0) != 2:
+        return migrated
+    request = dict(migrated.get("request", {}) or {})
+    if int(request.get("schema_version", 0) or 0) != 2:
+        raise ValueError("CaseRunResult v2 contains a non-v2 request envelope")
+    request_metadata = dict(request.get("metadata", {}) or {})
+    historical_inputs = dict(request.get("input_artifacts", {}) or {})
+    if historical_inputs:
+        request_metadata["historical_unbound_input_artifacts"] = historical_inputs
+    request_metadata["case_run_schema_migration"] = {
+        "from": original_version,
+        "to": 3,
+        "mode": "historical_manifest_result",
+    }
+    request["input_artifacts"] = {}
+    request["input_artifact_bindings"] = {}
+    request["metadata"] = request_metadata
+    request["schema_version"] = 3
+    result_metadata = dict(migrated.get("metadata", {}) or {})
+    result_metadata["case_run_schema_migration"] = {
+        "from": original_version,
+        "to": 3,
+        "mode": "historical_manifest_result",
+    }
+    migrated["request"] = request
+    migrated["metadata"] = result_metadata
+    migrated["schema_version"] = 3
+    return migrated
 
 
 @dataclass(frozen=True)
@@ -89,7 +206,9 @@ class ProjectRunManifest:
             payload = record.get("result")
             if not isinstance(payload, Mapping):
                 continue
-            result = CaseRunResult.from_dict(payload)
+            result = CaseRunResult.from_dict(
+                _migrate_historical_case_result(payload)
+            )
             if not result.ok:
                 continue
             request = result.request
@@ -177,12 +296,22 @@ class ProjectRunRecorder:
             "artifact_refs": {
                 name: ref.as_dict() for name, ref in result.artifact_refs.items()
             },
+            "artifact_publications": {
+                name: receipt.as_dict()
+                for name, receipt in result.artifact_publications.items()
+            },
+            "diagnostic_artifact_refs": {
+                name: ref.as_dict()
+                for name, ref in result.diagnostic_artifact_refs.items()
+            },
             "result": result.as_dict(),
         }
         if isinstance(prior.get("external_task"), Mapping):
             record["external_task"] = dict(prior["external_task"])
         self._records[key] = record
-        for name, ref in result.artifact_refs.items():
+        for name, ref in (result.artifact_refs.items() if result.ok else ()):
+            if name not in result.artifact_publications:
+                continue
             self._artifacts[f"{request.stage_name}.{request.case_name}.{name}"] = ref
             self._artifacts[f"{request.case_name}.{name}"] = ref
             self._artifacts.setdefault(str(name), ref)

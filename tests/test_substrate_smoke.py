@@ -490,9 +490,97 @@ GROUPS = {"default": {"stages": ["main"]}}
         "model_uri": result.artifact_registry["producer.model"].uri,
         "overrides": {"trainer": {"max_steps": 2}},
     }
+    binding = result.case_results[1].request.input_artifact_bindings["model"]
+    assert binding.ref == result.artifact_registry["producer.model"]
+    assert binding.publication.artifact_name == "model"
     assert result.artifact_registry["main.producer.model"].kind == "model"
     assert Path(result.artifact_registry["producer.model"].uri).is_file()
     assert run_project(project_root) == 0
+
+
+def test_build_check_validates_artifact_consumer_without_forging_publication(
+    tmp_path,
+) -> None:
+    project_root = create_project(
+        tmp_path / "artifact_build_check",
+        framework="blackbase",
+    )
+    producer_root = add_case("producer", "solver", project_root=project_root)
+    consumer_root = add_case("consumer", "trainer", project_root=project_root)
+    (producer_root / "build_solver.py").write_text(
+        """
+class Case:
+    def __init__(self, resource_context=None):
+        self.resource_context = resource_context
+
+    def run(self):
+        ref = self.case_runtime.publish_artifact("model", {"value": 1})
+        return {"artifact_refs": {"model": ref}}
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, component_overrides
+    return Case(resource_context)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (consumer_root / "build_solver.py").write_text(
+        """
+class Case:
+    def __init__(self, resource_context=None):
+        self.resource_context = resource_context
+        self.input_artifacts = {}
+
+    def set_input_artifacts(self, refs):
+        self.input_artifacts = dict(refs)
+
+    def fit(self):
+        return {"model_uri": self.input_artifacts["model"].uri}
+
+def build_solver(config=None, *, resource_context=None, component_overrides=None):
+    del config, component_overrides
+    return Case(resource_context)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (project_root / "project_config.py").write_text(
+        """
+PROJECT_NAME = "artifact_build_check"
+L0 = {
+    "namespace": "artifact_build_check",
+    "offer": {"threads": 1, "gpus": 0, "backend": "local"},
+    "policy": {"mode": "strict", "max_workers": 1, "max_threads": 1},
+    "default_request": {"workers": 1, "threads": 1, "gpus": 0, "backend": "local"},
+}
+STAGES = [
+    {"name": "produce", "cases": ["producer"]},
+    {
+        "name": "consume",
+        "cases": ["consumer"],
+        "input_artifacts": {"consumer": {"model": "producer.model"}},
+    },
+]
+GROUPS = {"default": {"stages": ["produce", "consume"]}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = execute_project(
+        project_root,
+        check=True,
+        build_check=True,
+        record=False,
+    )
+
+    assert result.ok
+    consumer = result.case_results[1]
+    assert consumer.request.input_artifacts == {}
+    assert consumer.request.input_artifact_bindings == {}
+    assert dict(consumer.request.metadata["declared_input_artifacts"]) == {
+        "model": "producer.model"
+    }
+    assert dict(consumer.request.metadata["unresolved_check_input_artifacts"]) == {
+        "model": "producer.model"
+    }
 
 
 def test_execute_project_runs_parallel_cases_in_isolated_processes(tmp_path) -> None:
@@ -785,12 +873,24 @@ GROUPS = {"default": {"stages": ["produce", "consume"]}}
         "model_uri": model_uri,
         "count": 2,
     }
+    assert (
+        resumed.case_results[1].request.input_artifact_bindings["model"].ref.uri
+        == model_uri
+    )
     assert (project_root / "producer.count").read_text(encoding="utf-8") == "1"
     assert (project_root / "consumer.count").read_text(encoding="utf-8") == "2"
     assert resumed.resumed_from == first.manifest_path
     resumed_manifest = json.loads(Path(resumed.manifest_path).read_text(encoding="utf-8"))
     assert resumed_manifest["status"] == "ok"
     assert resumed_manifest["resumed_from"] == first.manifest_path
+
+    Path(model_uri).write_bytes(b"tampered")
+    with pytest.raises(ProjectConfigurationError, match="valid finalized publication receipt"):
+        execute_project(
+            project_root,
+            run_id="attempt-three",
+            resume_from=first.manifest_path,
+        )
 
     config_path.write_text(config_path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
     with pytest.raises(ProjectConfigurationError, match="config fingerprint"):

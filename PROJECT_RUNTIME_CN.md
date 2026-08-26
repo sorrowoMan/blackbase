@@ -4,15 +4,17 @@ blackbase 是 `nsgablack + mlblack` 统一框架栈的 Project / Case / Scaffold
 
 ## Stage 执行
 
-`project_config.py` 中的 Stage 支持两种策略：
+`project_config.py` 中的 Stage 支持四种策略：
 
 - `policy="serial"`：按声明顺序在主进程执行。
 - `policy="parallel"`（兼容名 `run_all_in_parallel`）：在相互隔离的子进程中执行 Case。
 - `policy="external"`（兼容名 `external_workers`）：通过耐久 transport 交给独立 worker 进程执行。
+- `policy="dag"`（兼容名 `dependency_graph`）：根据 Case 依赖自动选择就绪节点并行执行。
 
 并行 Stage 的 Case 必须使用标准 `build_solver.py` 装配入口和 `mode="build"`。CLI fanout 没有可靠的进程内对象与 artifact 注入契约，因此运行时会明确拒绝并行 `mode="cli"`，不会静默退化成串行。
 
-同一并行 Stage 内的 Case 被视为互相独立。它们可以消费先前 Stage 注册的 `DataRef`，不能依赖同一 Stage 中尚未完成的 Case。需要依赖关系时，应拆成两个 Stage。
+普通并行 Stage 内的 Case 被视为互相独立。它们可以消费先前 Stage 注册的 `DataRef`，
+但不能依赖同一 Stage 中尚未完成的 Case。同一 Stage 需要依赖关系时使用 DAG。
 
 ```python
 STAGES = [
@@ -31,6 +33,46 @@ STAGES = [
 ```
 
 Project L0 在父进程中先发放 lease，再提交子进程。所有活动 lease 的 workers、threads、GPU、memory 和独占 device token 会做聚合校验；资源不足时，调度器形成资源允许的执行波次，而不是超额授权。
+
+## DAG Stage
+
+DAG 只描述运行前已知的 Case 依赖。普通控制依赖写入 `depends_on`；权威 Artifact 输入
+会自动推导同 Stage 依赖边：
+
+```python
+STAGES = [{
+    "name": "workflow",
+    "policy": "dag",
+    "max_workers": 4,
+    "cases": ["prepare", "train", "baseline", "evaluate"],
+    "depends_on": {
+        "train": ["prepare"],
+    },
+    "input_artifacts": {
+        "evaluate": {
+            "model": "train.model",
+            "baseline": "baseline.report",
+        },
+    },
+}]
+```
+
+由此得到 `prepare → train → evaluate` 与 `baseline → evaluate`。`prepare` 和
+`baseline` 首先成为就绪节点并在 L0 授权范围内并行；两个上游成功且 Artifact 发布回执
+验证完成后，`evaluate` 才会被提交。
+
+规则如下：
+
+- `depends_on` 只能引用同一 DAG Stage 中的 Case；未知节点、自依赖和环会在运行前失败。
+- `producer.artifact` 与 `stage.producer.artifact` 会推导依赖；无生产者信息的短名不会猜测。
+- Case 结果保留 DAG schema、显式依赖、Artifact 推导依赖和拓扑位置审计。
+- 默认 `failure_policy="fail_fast"`；`continue` 会继续独立分支，并用
+  `DependencyFailed` 明确跳过失败节点的全部后代。
+- 恢复成功的节点视为已完成，但其 Artifact 必须通过原有 publication receipt 验证。
+
+DAG 与动态嵌套不是替代关系。DAG 负责 Project 中预先可知的 Case 图；外层 Solver 在
+`evaluate()` 中按候选动态创建 Trainer、Trainer 再创建 Solver，仍通过
+`CaseRuntimeContext.invoke()` 形成运行时调用树。
 
 ## 失败语义
 
